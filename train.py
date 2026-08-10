@@ -211,14 +211,46 @@ def main():
     parser.add_argument("--window-samples", type=int, default=1000, help="Window sample length (default: 1000)")
     parser.add_argument("--embed-dim", type=int, default=128, help="Token embedding dimension (default: 128)")
     parser.add_argument("--binary-preictal", action="store_true", help="Map labels into binary classification (1: preictal p*, 0: interictal)")
-    parser.add_argument("--cache-capacity", type=int, default=128, help="LRU cache capacity for session arrays (default: 128)")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes (default: 0)")
+    parser.add_argument("--cache-capacity", type=int, default=4, help="LRU cache capacity for session arrays (default: 4)")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes (default: 4)")
+    parser.add_argument("--output-dir", default="checkpoints", help="Directory to save training checkpoints")
+    parser.add_argument("--resume", action="store_true", help="Resume from the latest checkpoint in output-dir")
+    parser.add_argument("--load-checkpoint", type=str, default=None, help="Path to a specific checkpoint file to load")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
+    import os
+    os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+
+    # ---- Checkpoint loading ----
+    start_epoch = 1
+    best_val_loss = float('inf')
+    if args.load_checkpoint is not None:
+        ckpt_path = args.load_checkpoint
+    elif args.resume:
+        # Find latest checkpoint in output_dir
+        ckpt_files = [f for f in os.listdir(args.output_dir) if f.startswith('epoch_') and f.endswith('.pt')]
+        if ckpt_files:
+            latest = max(ckpt_files, key=lambda x: int(x.split('_')[1].split('.')[0]))
+            ckpt_path = os.path.join(args.output_dir, latest)
+        else:
+            ckpt_path = None
+    else:
+        ckpt_path = None
+
+    if ckpt_path is not None and os.path.isfile(ckpt_path):
+        logger.info(f"Loading checkpoint {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        # Model will be created later; store state dicts for later use
+        loaded_state_dict = checkpoint['model_state_dict']
+        loaded_optimizer_state = checkpoint['optimizer_state_dict']
+        start_epoch = checkpoint.get('epoch', 1) + 1
+        best_val_loss = checkpoint.get('best_val_loss', best_val_loss)
+    else:
+        loaded_state_dict = None
+        loaded_optimizer_state = None
 
     # 1. Load Datasets
     logger.info("Initializing DataLoaders...")
@@ -235,8 +267,9 @@ def main():
     )
 
     num_classes = dataset.num_classes
-    sample_windows, _ = next(iter(train_loader))
-    _, n_channels, n_samples = sample_windows.shape
+    logger.info("Inferring tensor dimensions from dataset...")
+    sample_window, _ = dataset[0]
+    n_channels, n_samples = sample_window.shape
 
     logger.info(f"Dataset loaded: {len(dataset)} samples | {num_classes} classes")
     logger.info(f"EEG shape: channels={n_channels}, samples={n_samples}")
@@ -247,15 +280,47 @@ def main():
         embed_dim=args.embed_dim,
         num_classes=num_classes,
     ).to(device)
+    if loaded_state_dict is not None:
+        model.load_state_dict(loaded_state_dict)
+        logger.info("Model state loaded from checkpoint")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    if loaded_optimizer_state is not None:
+        optimizer.load_state_dict(loaded_optimizer_state)
+        logger.info("Optimizer state loaded from checkpoint")
 
     # 3. Train Loop
     logger.info("Starting Training Loop...")
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         logger.info(f"--- Epoch {epoch:02d}/{args.epochs:02d} ---")
         train_loss, s1_loss, s3_loss = train_epoch(model, train_loader, optimizer, device)
         val_loss, val_acc = validate(model, val_loader, device)
+        # Save checkpoint
+        ckpt_path = os.path.join(args.output_dir, f"epoch_{epoch:02d}.pt")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'best_val_loss': min(best_val_loss, val_loss)
+        }, ckpt_path)
+        logger.info(f"Saved checkpoint to {ckpt_path}")
+        # Update best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_path = os.path.join(args.output_dir, "best.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'best_val_loss': best_val_loss
+            }, best_path)
+            logger.info(f"New best model saved to {best_path}")
 
         logger.info(
             f"Epoch {epoch:02d} Summary | "

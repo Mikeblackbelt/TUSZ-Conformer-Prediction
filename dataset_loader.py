@@ -51,6 +51,7 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -246,7 +247,8 @@ class EEGWindowDataset(Dataset):
 
         # 5. Filter out sessions whose checkpoint files do not exist on disk
         if skip_missing_checkpoints and os.path.exists(checkpoint_dir):
-            valid_mask = self.df["session_key"].apply(
+            tqdm.pandas(desc="Verifying checkpoint files")
+            valid_mask = self.df["session_key"].progress_apply(
                 lambda k: _find_checkpoint_file(checkpoint_dir, k, stage) is not None
             )
             initial_count = len(self.df)
