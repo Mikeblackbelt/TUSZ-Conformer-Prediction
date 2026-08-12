@@ -14,7 +14,7 @@ Actual master CSV schema (confirmed):
 ASSUMPTIONS -- please check these and adjust constructor args if wrong:
   - `session_key` isn't a column, so it's derived from `edf_path`'s
     basename (no extension) -- e.g. ".../aaaaaaaa_s001_t000.edf" ->
-    "aaaaaaaa_s001_t000" -- to match `{session_key}_{stage}.npz/.npy`
+    "aaaaaaaa_s001_t000" -- to match `{session_key}_{stage}.parquet/.npz/.npy`
     checkpoint filenames. Override `session_key_fn` if your checkpoint
     naming derives session_key differently.
   - `channel` follows TUSZ annotation convention: either a specific
@@ -34,6 +34,14 @@ ASSUMPTIONS -- please check these and adjust constructor args if wrong:
     preictal/postictal/interictal windows.
   - Checkpoint arrays are `(n_channels, n_samples)` float arrays at a
     fixed `sampling_rate`, matching the pipeline's axis convention.
+  - CHECKPOINT FORMAT: loader now prefers `.parquet` (columns =
+    channels, rows = samples, transposed back to (n_channels,
+    n_samples) on load) over the legacy `.npz`/`.npy` formats, since
+    parquet's columnar compression cuts checkpoint size significantly
+    versus raw npz -- useful if you're tight on disk quota. All three
+    formats are supported side by side per session; `.parquet` wins if
+    present, otherwise falls back to `.npz` then `.npy`. Requires
+    `pyarrow` (`pip install pyarrow`).
   - Patient ID (for any grouping/sanity checks) is the session_key
     substring before the first underscore (TUSZ convention:
     `aaaaaaaa_s001_t000` -> patient `aaaaaaaa`).
@@ -46,10 +54,11 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
@@ -65,11 +74,25 @@ def _default_patient_id_fn(session_key: str) -> str:
     return session_key.split("_")[0]
 
 
-def _load_checkpoint_array(path_npz: str, path_npy: str) -> Optional[np.ndarray]:
-    arr = None
-    if os.path.exists(path_npz):
-        with np.load(path_npz) as data:
-            # support either a bare array or a dict-like npz with an 'eeg'/'data' key
+# Checked in this order -- parquet first since it's the compressed,
+# disk-friendly format; npz/npy kept as fallbacks for any sessions not
+# yet converted.
+_CHECKPOINT_EXTENSIONS: Tuple[str, ...] = (".parquet", ".npz", ".npy")
+
+
+def _load_parquet_array(path: str) -> np.ndarray:
+    """Loads a (n_channels, n_samples) float32 array from a parquet
+    checkpoint. Expected layout: one column per channel, one row per
+    sample -- i.e. the transpose of the pipeline's (n_channels,
+    n_samples) convention -- so we transpose back on load."""
+    table = pq.read_table(path)
+    arr = table.to_pandas().to_numpy(dtype=np.float32).T
+    return np.ascontiguousarray(arr)
+
+
+def _load_npz_or_npy_array(path: str) -> np.ndarray:
+    if path.endswith(".npz"):
+        with np.load(path) as data:
             if "eeg" in data:
                 arr = data["eeg"]
             elif "data" in data:
@@ -77,45 +100,63 @@ def _load_checkpoint_array(path_npz: str, path_npy: str) -> Optional[np.ndarray]
             else:
                 first_key = list(data.keys())[0]
                 arr = data[first_key]
-    elif os.path.exists(path_npy):
-        arr = np.load(path_npy)
+    else:
+        arr = np.load(path)
 
-    if arr is not None and arr.dtype == np.float64:
+    if arr.dtype == np.float64:
         arr = arr.astype(np.float32)
     return arr
+
+
+def _load_checkpoint_array(base_path: str) -> Optional[np.ndarray]:
+    """Given a base path with no extension (e.g. '.../aaaaaaaa_s001_t000_raw'),
+    tries each supported checkpoint extension in `_CHECKPOINT_EXTENSIONS`
+    order and loads the first one found. Returns None if nothing exists."""
+    for ext in _CHECKPOINT_EXTENSIONS:
+        candidate = base_path + ext
+        if os.path.exists(candidate):
+            if ext == ".parquet":
+                return _load_parquet_array(candidate)
+            return _load_npz_or_npy_array(candidate)
+    return None
 
 
 _DIR_INDEX_CACHE: dict[Tuple[str, str], dict[str, str]] = {}
 
 
 def _get_dir_index(checkpoint_dir: str, stage: str) -> dict[str, str]:
+    """Maps '_{patient}_{sess}_' tokens (and full filename stems) to base
+    paths (no extension) for every checkpoint file matching `stage` in
+    `checkpoint_dir`, across all supported extensions."""
     key = (checkpoint_dir, stage)
     if key not in _DIR_INDEX_CACHE:
         index = {}
         if os.path.exists(checkpoint_dir):
-            suffix_npz = f"_{stage}.npz"
-            suffix_npy = f"_{stage}.npy"
+            suffixes = tuple(f"_{stage}{ext}" for ext in _CHECKPOINT_EXTENSIONS)
             for fname in os.listdir(checkpoint_dir):
-                if fname.endswith(suffix_npz) or fname.endswith(suffix_npy):
-                    full_path = os.path.join(checkpoint_dir, os.path.splitext(fname)[0])
-                    # Parse out tokens like _aaaaaaac_s001_
-                    parts = fname.split("_")
-                    for i in range(len(parts) - 1):
-                        if parts[i].startswith("s") and len(parts[i]) == 4 and parts[i][1:].isdigit() and i > 0:
-                            patient = parts[i - 1]
-                            sess = parts[i]
-                            index[f"_{patient}_{sess}_"] = full_path
-                    # Also store full filename stem
-                    index[os.path.splitext(fname)[0]] = full_path
+                matched_suffix = next((s for s in suffixes if fname.endswith(s)), None)
+                if matched_suffix is None:
+                    continue
+                full_base_path = os.path.join(checkpoint_dir, os.path.splitext(fname)[0])
+                # Parse out tokens like _aaaaaaac_s001_
+                parts = fname.split("_")
+                for i in range(len(parts) - 1):
+                    if parts[i].startswith("s") and len(parts[i]) == 4 and parts[i][1:].isdigit() and i > 0:
+                        patient = parts[i - 1]
+                        sess = parts[i]
+                        index[f"_{patient}_{sess}_"] = full_base_path
+                # Also store full filename stem
+                index[os.path.splitext(fname)[0]] = full_base_path
         _DIR_INDEX_CACHE[key] = index
     return _DIR_INDEX_CACHE[key]
 
 
-def _find_checkpoint_file(checkpoint_dir: str, session_key: str, stage: str) -> Optional[Tuple[str, str]]:
-    """Locates matching .npz / .npy checkpoint file for a given session key and stage."""
+def _find_checkpoint_file(checkpoint_dir: str, session_key: str, stage: str) -> Optional[str]:
+    """Locates the base path (no extension) for a session's checkpoint,
+    across whichever of `.parquet`/`.npz`/`.npy` actually exists."""
     base = os.path.join(checkpoint_dir, f"{session_key}_{stage}")
-    if os.path.exists(base + ".npz") or os.path.exists(base + ".npy"):
-        return base + ".npz", base + ".npy"
+    if any(os.path.exists(base + ext) for ext in _CHECKPOINT_EXTENSIONS):
+        return base
 
     index = _get_dir_index(checkpoint_dir, stage)
     parts = session_key.split("_")
@@ -123,8 +164,7 @@ def _find_checkpoint_file(checkpoint_dir: str, session_key: str, stage: str) -> 
         patient, sess = parts[0], parts[1]
         target_key = f"_{patient}_{sess}_"
         if target_key in index:
-            matched_base = index[target_key]
-            return matched_base + ".npz", matched_base + ".npy"
+            return index[target_key]
     return None
 
 
@@ -145,15 +185,15 @@ class SessionCache:
             self._cache.move_to_end(session_key)
             return self._cache[session_key]
 
-        paths = _find_checkpoint_file(self.checkpoint_dir, session_key, self.stage)
+        base_path = _find_checkpoint_file(self.checkpoint_dir, session_key, self.stage)
         arr = None
-        if paths is not None:
-            arr = _load_checkpoint_array(paths[0], paths[1])
+        if base_path is not None:
+            arr = _load_checkpoint_array(base_path)
 
         if arr is None:
             raise FileNotFoundError(
                 f"No {self.stage} checkpoint found for session '{session_key}' "
-                f"in {self.checkpoint_dir} (looked for .npz and .npy)"
+                f"in {self.checkpoint_dir} (looked for {', '.join(_CHECKPOINT_EXTENSIONS)})"
             )
 
         self._cache[session_key] = arr
@@ -169,7 +209,8 @@ class EEGWindowDataset(Dataset):
     See module docstring for the full assumption list. Key args:
 
         master_csv: path to the CSV from `build_master_file()`.
-        checkpoint_dir: directory holding `{session_key}_{stage}.npz/.npy`.
+        checkpoint_dir: directory holding `{session_key}_{stage}.parquet`
+            (preferred) or `.npz`/`.npy` (legacy fallback).
         stage: "raw" or "proc" -- which checkpoint set to read from
             (use "proc" if you ran `--create-montage`).
         sampling_rate: Hz, used to convert start/stop_time seconds
