@@ -66,7 +66,9 @@ from torch.utils.data import DataLoader, Dataset
 
 def _default_session_key_fn(edf_path: str) -> str:
     """basename without extension, e.g. '.../aaaaaaaa_s001_t000.edf' -> 'aaaaaaaa_s001_t000'"""
-    return os.path.splitext(os.path.basename(edf_path))[0]
+    # Normalize backslashes to forward slashes for Linux/WSL compatibility
+    normalized_path = str(edf_path).replace("\\", "/")
+    return os.path.splitext(os.path.basename(normalized_path))[0]
 
 
 def _default_patient_id_fn(session_key: str) -> str:
@@ -324,6 +326,8 @@ class EEGWindowDataset(Dataset):
         self.label_map = label_map
         self.num_classes = len(set(label_map.values()))
 
+        self.status_col = status_col
+        self.return_dict = True
         self._cache = SessionCache(checkpoint_dir, stage, capacity=cache_capacity)
         self.n_resized = 0  # counts windows that needed crop/pad, for sanity checks
 
@@ -363,13 +367,37 @@ class EEGWindowDataset(Dataset):
         session_key = row["session_key"]
 
         arr = self._cache.get(session_key)
-        window = self._slice_window(arr, float(row[self.start_col]), float(row[self.stop_col]))
+        start_time = float(row[self.start_col])
+        stop_time = float(row[self.stop_col])
+        window = self._slice_window(arr, start_time, stop_time)
 
-        label = self.label_map[row[self.label_col]]
+        raw_label = row[self.label_col]
+        label = self.label_map[raw_label]
+        status_val = int(row[self.status_col]) if self.status_col in row else 1
 
         window_t = torch.from_numpy(np.ascontiguousarray(window)).float()
         label_t = torch.tensor(label, dtype=torch.long)
-        return window_t, label_t
+
+        if not self.return_dict:
+            return window_t, label_t
+
+        # Multi-task ground truth targets:
+        # Occurrence (IF): 0 for non-seizure/background, 1 for preictal/ictal
+        has_seizure = 0.0 if (label == 0 or str(raw_label).startswith("b")) else 1.0
+        occurrence_t = torch.tensor(has_seizure, dtype=torch.float32)
+
+        # Timing offset (WHEN): duration/start offset of preictal phase
+        onset_offset_t = torch.tensor(start_time, dtype=torch.float32)
+        status_t = torch.tensor(status_val, dtype=torch.long)
+
+        targets = {
+            "label": label_t,
+            "occurrence": occurrence_t,
+            "onset_offset": onset_offset_t,
+            "status": status_t,
+        }
+        return window_t, targets
+
 
 
 def split_by_column(dataset: EEGWindowDataset, split_map: Optional[dict] = None):
@@ -423,12 +451,16 @@ def build_dataloaders(
             f"train_split_name/val_split_name to match your actual values."
         )
 
+    persistent = num_workers > 0
     train_loader = DataLoader(
         subsets[train_split_name], batch_size=batch_size, shuffle=True,
         num_workers=num_workers, drop_last=True,
+        pin_memory=True, persistent_workers=persistent,
     )
     val_loader = DataLoader(
-        subsets[val_split_name], batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        subsets[val_split_name], batch_size=batch_size, shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True, persistent_workers=persistent,
     )
     return train_loader, val_loader, dataset
 

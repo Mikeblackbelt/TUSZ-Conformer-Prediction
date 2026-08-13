@@ -1,21 +1,19 @@
 """
-Causal Generative EEG-Conformer for Next-Patch/Token Prediction.
+Causal EEG-Conformer for Preictal Generation, Seizure Detection & Timing, and Seizure Type Classification.
 
 Architecture:
-1. PatchEmbedding: Temporal Conv -> Spatial Conv front-end to extract patch tokens
-   from (B, 1, C, T) EEG windows.
-2. PositionalEncoding: Adds learnable sequence positional embeddings.
-3. CausalTransformerEncoder: Stack of Pre-Norm Transformer / Conformer blocks
-   with lower-triangular causal masking so token i only attends to tokens 1..i.
-4. NextTokenPredictionHead: Per-position projection head predicting the next patch
-   vector (or codebook index) for autoregressive generation of EEG transitions
-   (e.g., interictal -> preictal -> ictal evolution).
+1. ConvFrontEnd & PositionalEncoding: Converts (B, 1, C, T) EEG preictal windows into sequence patch tokens.
+2. Horizon Next-Token Generator: Autoregressively generates EEG tokens representing the horizon
+   between the end of the preictal phase and seizure onset (longest distance / SPH).
+3. Seizure Occurrence & Timing Classifier: Predicts IF a seizure occurs (occurrence logit)
+   and WHEN it occurs (relative onset time/token offset).
+4. Seizure Type Classifier: Multi-class classifier predicting seizure type downstream of detection.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -26,10 +24,6 @@ class ConvFrontEnd(nn.Module):
     """
     EEG Spatial-Temporal Convolutional Front-End.
     Transforms (B, 1, n_channels, n_samples) raw window into a sequence of patch tokens.
-    
-    1. Temporal Convolution: extracts frequency/spectral features across time.
-    2. Spatial Convolution: combines channels for spatial/montage features.
-    3. Patching / Pooling: downsamples along the time dimension into discrete patch tokens.
     """
 
     def __init__(
@@ -89,7 +83,7 @@ class ConvFrontEnd(nn.Module):
 
 class PositionalEncoding(nn.Module):
     """
-    Learnable or sinusoidal positional encoding for token sequences.
+    Learnable positional encoding for sequence tokens.
     """
 
     def __init__(self, embed_dim: int, max_len: int = 2000):
@@ -108,8 +102,7 @@ class PositionalEncoding(nn.Module):
 
 class CausalTransformerEncoderBlock(nn.Module):
     """
-    Pre-norm Causal Transformer Encoder block with Multi-Head Self-Attention (MHSA)
-    and Feed-Forward Network (FFN / GEGLU style).
+    Pre-norm Causal Transformer Encoder block with Multi-Head Self-Attention (MHSA).
     """
 
     def __init__(
@@ -137,11 +130,6 @@ class CausalTransformerEncoderBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, seq_len, embed_dim)
-        causal_mask: (seq_len, seq_len) boolean / float mask preventing attention to future tokens.
-        """
-        # Multi-Head Causal Self-Attention
         norm_x = self.ln1(x)
         attn_out, _ = self.attn(
             query=norm_x,
@@ -151,16 +139,14 @@ class CausalTransformerEncoderBlock(nn.Module):
             need_weights=False,
         )
         x = x + attn_out
-
-        # FFN
         x = x + self.ffn(self.ln2(x))
         return x
 
 
 class NextTokenPredictionHead(nn.Module):
     """
-    Per-position next-token / patch prediction head.
-    Predicts target patch feature vector for position t+1 from hidden state at position t.
+    Per-position next-token/patch prediction head.
+    Predicts the feature vector at position t+1 from hidden state at position t.
     """
 
     def __init__(self, embed_dim: int, target_dim: Optional[int] = None, dropout: float = 0.1):
@@ -174,40 +160,100 @@ class NextTokenPredictionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Input x: (B, seq_len, embed_dim)
-        Output: (B, seq_len, out_dim)
-        """
         return self.head(x)
+
+
+class SeizureOccurrenceAndTimingHead(nn.Module):
+    """
+    Task 2 Classifier: Determines IF a seizure occurs (occurrence) and WHEN (onset timing offset).
+    """
+
+    def __init__(self, embed_dim: int = 128, hidden_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.shared = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        # Binary logit for seizure occurrence (if)
+        self.occurrence_head = nn.Linear(hidden_dim, 1)
+        # Continuous onset time/token index offset (when)
+        self.timing_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, sequence_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Input: (B, seq_len, embed_dim)
+        Returns:
+            occurrence_logits: (B, 1) - raw logit for seizure presence (sigmoid for prob)
+            onset_preds: (B, 1) - predicted onset offset in seconds / token steps
+        """
+        # Pool across sequence dimension: (B, embed_dim, seq_len) -> (B, embed_dim)
+        pooled = self.pool(sequence_features.permute(0, 2, 1)).squeeze(-1)
+        feat = self.shared(pooled)
+
+        occ_logits = self.occurrence_head(feat)
+        onset_preds = self.timing_head(feat)
+        return occ_logits, onset_preds
+
+
+class SeizureTypeClassifierHead(nn.Module):
+    """
+    Task 3 Classifier: Classifies the seizure by type (e.g. gnsz, fnsz, cpsz, absz, etc.)
+    downstream of seizure occurrence detection.
+    """
+
+    def __init__(self, embed_dim: int = 128, num_classes: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, num_classes),
+        )
+
+    def forward(self, sequence_features: torch.Tensor) -> torch.Tensor:
+        """
+        Input: (B, seq_len, embed_dim)
+        Returns: type_logits: (B, num_classes)
+        """
+        pooled = self.pool(sequence_features.permute(0, 2, 1)).squeeze(-1)
+        type_logits = self.classifier(pooled)
+        return type_logits
 
 
 class CausalEEGConformer(nn.Module):
     """
-    Causal Generative EEG-Conformer.
-    
-    Processes EEG windows autoregressively, predicting the next EEG token/patch
-    from preceding tokens. Designed to model continuous phase dynamics and
-    transitions (e.g. interictal -> preictal -> ictal evolution).
+    Complete 3-Stage Model Architecture:
+    1. Preictal next-token prediction head generates tokens matching the longest distance
+       between end of preictal phase and start of ictal (horizon generation).
+    2. Seizure Occurrence & Timing Classifier determines IF and WHEN a seizure occurs.
+    3. Seizure Type Classifier classifies seizure type downstream of detection.
     """
 
     def __init__(
         self,
         n_channels: int,
         embed_dim: int = 128,
-        depth: int = 6,
+        depth: int = 4,
         num_heads: int = 4,
         ffn_dim: int = 512,
         temp_kernel: int = 25,
         stride: int = 10,
         dropout: float = 0.1,
         max_len: int = 2000,
+        num_classes: int = 2,
+        default_horizon_tokens: int = 10,
     ):
         super().__init__()
         self.n_channels = n_channels
         self.embed_dim = embed_dim
         self.stride = stride
+        self.default_horizon_tokens = default_horizon_tokens
+        self.num_classes = num_classes
 
-        # Front-end Patch Embedding
+        # 1. Front-end Patch Embedding & Positional Encoding
         self.front_end = ConvFrontEnd(
             n_channels=n_channels,
             embed_dim=embed_dim,
@@ -215,8 +261,6 @@ class CausalEEGConformer(nn.Module):
             stride=stride,
             dropout=dropout,
         )
-
-        # Positional Encoding
         self.pos_encoder = PositionalEncoding(embed_dim=embed_dim, max_len=max_len)
 
         # Causal Transformer Stack
@@ -229,103 +273,126 @@ class CausalEEGConformer(nn.Module):
             )
             for _ in range(depth)
         ])
-
         self.ln_f = nn.LayerNorm(embed_dim)
 
-        # Next-Token Prediction Head
+        # Task 1: Next-Token Prediction / Horizon Generation Head
         self.pred_head = NextTokenPredictionHead(embed_dim=embed_dim, target_dim=embed_dim, dropout=dropout)
 
+        # Task 2: Seizure Occurrence (IF) and Timing (WHEN) Classifier
+        self.occurrence_timing_head = SeizureOccurrenceAndTimingHead(
+            embed_dim=embed_dim, hidden_dim=ffn_dim // 2, dropout=dropout
+        )
+
+        # Task 3: Seizure Type Classifier
+        self.type_head = SeizureTypeClassifierHead(
+            embed_dim=embed_dim, num_classes=num_classes, dropout=dropout
+        )
+
     def _generate_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """
-        Creates lower-triangular mask (0 for valid, -inf for masked future positions).
-        """
-        mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1)
-        return mask
+        return torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """
-        Input x: (B, n_channels, n_samples) or (B, 1, n_channels, n_samples)
-        
-        Returns:
-            predicted_next_tokens: (B, num_patches, embed_dim)
-                At position i, predicts the patch token at position i+1.
-            patch_tokens: (B, num_patches, embed_dim)
-                Ground-truth patch tokens extracted by the conv front-end.
+        Passes a token sequence through Positional Encoding and Causal Transformer blocks.
         """
-        # 1. Front-end patch extraction
-        tokens = self.front_end(x)  # (B, num_patches, embed_dim)
         seq_len = tokens.shape[1]
-
-        # 2. Add positional encoding
         h = self.pos_encoder(tokens)
-
-        # 3. Create Causal Mask
-        causal_mask = self._generate_causal_mask(seq_len, device=x.device)
-
-        # 4. Pass through Causal Transformer blocks
+        causal_mask = self._generate_causal_mask(seq_len, device=tokens.device)
         for block in self.blocks:
             h = block(h, causal_mask)
+        return self.ln_f(h)
 
-        h = self.ln_f(h)
-
-        # 5. Next-token prediction
-        pred_next = self.pred_head(h)  # (B, num_patches, embed_dim)
-
-        return pred_next, tokens
-
-    def compute_loss(self, x: torch.Tensor) -> torch.Tensor:
+    def generate_horizon(
+        self,
+        seed_tokens: torch.Tensor,
+        horizon_steps: Optional[int] = None,
+    ) -> torch.Tensor:
         """
-        Autoregressive next-patch prediction loss (MSE Loss between predicted token_i+1
-        and actual target token_i+1).
+        Task 1: Autoregressively generates 'horizon_steps' patch tokens from preictal window tokens.
+        Matches the longest distance between end of preictal phase and start of ictal.
         """
-        pred_next, tokens = self.forward(x)
+        steps = horizon_steps if horizon_steps is not None else self.default_horizon_tokens
+        curr_tokens = seed_tokens.clone()
 
-        # Target for position t (0..N-2) is token at t+1 (1..N-1)
-        preds = pred_next[:, :-1, :]
-        targets = tokens[:, 1:, :]
-
-        loss = F.mse_loss(preds, targets)
-        return loss
-
-    @torch.no_grad()
-    def generate(self, seed_x: torch.Tensor, steps: int = 10) -> torch.Tensor:
-        """
-        Autoregressively generate 'steps' future patch tokens given a seed EEG window.
-        
-        seed_x: (B, n_channels, n_samples) seed recording.
-        returns: generated patch sequence of shape (B, num_seed_patches + steps, embed_dim)
-        """
-        self.eval()
-        tokens = self.front_end(seed_x)  # (B, seed_patches, embed_dim)
-
+        generated_list = []
         for _ in range(steps):
-            seq_len = tokens.shape[1]
-            h = self.pos_encoder(tokens)
-            causal_mask = self._generate_causal_mask(seq_len, device=seed_x.device)
+            h_encoded = self.encode_tokens(curr_tokens)
+            next_token = self.pred_head(h_encoded[:, -1:, :])  # (B, 1, embed_dim)
+            generated_list.append(next_token)
+            curr_tokens = torch.cat([curr_tokens, next_token], dim=1)
 
-            for block in self.blocks:
-                h = block(h, causal_mask)
+        if generated_list:
+            gen_tokens = torch.cat(generated_list, dim=1)
+        else:
+            gen_tokens = torch.empty(seed_tokens.shape[0], 0, self.embed_dim, device=seed_tokens.device)
 
-            h = self.ln_f(h)
-            next_token = self.pred_head(h[:, -1:, :])  # Predict single next token (B, 1, embed_dim)
-            tokens = torch.cat([tokens, next_token], dim=1)
+        return gen_tokens
 
-        return tokens
+    def forward(
+        self,
+        x: torch.Tensor,
+        horizon_steps: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Input x: Preictal window EEG of shape (B, n_channels, n_samples)
+        
+        Returns dictionary containing:
+            - 'pred_next_tokens': Next token predictions for ground-truth preictal sequence (B, num_patches, embed_dim)
+            - 'preictal_tokens': Ground truth preictal patch tokens extracted by ConvFrontEnd (B, num_patches, embed_dim)
+            - 'generated_horizon_tokens': Autoregressively generated horizon tokens (B, horizon_steps, embed_dim)
+            - 'full_sequence_features': Encoded features of combined preictal + generated horizon sequence (B, total_seq_len, embed_dim)
+            - 'occurrence_logits': Seizure occurrence logits (B, 1) - Task 2 IF
+            - 'onset_preds': Seizure onset offset predictions (B, 1) - Task 2 WHEN
+            - 'type_logits': Seizure type classification logits (B, num_classes) - Task 3 TYPE
+        """
+        # 1. Front-end patch extraction of preictal phase window
+        preictal_tokens = self.front_end(x)  # (B, N_pre, embed_dim)
+
+        # Standard causal encoder pass over ground truth preictal window
+        h_preictal = self.encode_tokens(preictal_tokens)
+        pred_next_tokens = self.pred_head(h_preictal)  # (B, N_pre, embed_dim)
+
+        # Task 1: Generate horizon tokens corresponding to max distance preictal->ictal
+        steps = horizon_steps if horizon_steps is not None else self.default_horizon_tokens
+        generated_horizon_tokens = self.generate_horizon(preictal_tokens, horizon_steps=steps)
+
+        # Full trajectory = preictal + generated horizon
+        full_tokens = torch.cat([preictal_tokens, generated_horizon_tokens], dim=1)
+        full_sequence_features = self.encode_tokens(full_tokens)
+
+        # Task 2: Seizure Occurrence (IF) and Timing (WHEN)
+        occurrence_logits, onset_preds = self.occurrence_timing_head(full_sequence_features)
+
+        # Task 3: Seizure Type Classification
+        type_logits = self.type_head(full_sequence_features)
+
+        return {
+            "pred_next_tokens": pred_next_tokens,
+            "preictal_tokens": preictal_tokens,
+            "generated_horizon_tokens": generated_horizon_tokens,
+            "full_sequence_features": full_sequence_features,
+            "occurrence_logits": occurrence_logits,
+            "onset_preds": onset_preds,
+            "type_logits": type_logits,
+        }
+
+
+# Backwards compatibility alias
+FullPipelineModel = CausalEEGConformer
 
 
 if __name__ == "__main__":
-    # Quick sanity test
     B, C, T = 2, 19, 1000
     dummy_eeg = torch.randn(B, C, T)
 
-    model = CausalEEGConformer(n_channels=C)
-    pred_next, tokens = model(dummy_eeg)
-    loss = model.compute_loss(dummy_eeg)
+    model = CausalEEGConformer(n_channels=C, num_classes=3, default_horizon_tokens=8)
+    outputs = model(dummy_eeg)
 
     print(f"Input EEG shape: {dummy_eeg.shape}")
-    print(f"Extracted patch tokens shape: {tokens.shape}")
-    print(f"Predicted next tokens shape: {pred_next.shape}")
-    print(f"Autoregressive next-patch loss: {loss.item():.4f}")
-
-    gen_tokens = model.generate(dummy_eeg, steps=5)
-    print(f"Autoregressively generated tokens shape: {gen_tokens.shape}")
+    print(f"Preictal patch tokens shape: {outputs['preictal_tokens'].shape}")
+    print(f"Next-token prediction shape: {outputs['pred_next_tokens'].shape}")
+    print(f"Generated horizon tokens shape: {outputs['generated_horizon_tokens'].shape}")
+    print(f"Full sequence features shape: {outputs['full_sequence_features'].shape}")
+    print(f"Seizure occurrence logits shape (IF): {outputs['occurrence_logits'].shape}")
+    print(f"Seizure onset predictions shape (WHEN): {outputs['onset_preds'].shape}")
+    print(f"Seizure type logits shape (TYPE): {outputs['type_logits'].shape}")
