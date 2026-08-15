@@ -586,8 +586,9 @@ class EEGWindowDataset(Dataset):
         if indices is not None:
             col = col.iloc[indices]
         counts: dict = {}
-        for v in col:
-            counts[v] = counts.get(v, 0) + 1
+        for raw_val in col:
+            cls_idx = self.label_map.get(raw_val, raw_val)
+            counts[cls_idx] = counts.get(cls_idx, 0) + 1
         return counts
 
     def class_weights_tensor(
@@ -607,7 +608,7 @@ class EEGWindowDataset(Dataset):
         weights = []
         for c in range(num_cls):
             cnt = counts.get(c, 1)  # avoid div-by-zero for unseen classes
-            weights.append(total / (num_cls * cnt))
+            weights.append(total / (num_cls * max(1, cnt)))
         t = torch.tensor(weights, dtype=torch.float32)
         if device is not None:
             t = t.to(device)
@@ -621,14 +622,29 @@ class EEGWindowDataset(Dataset):
         """Scalar ``pos_weight`` for BCEWithLogitsLoss on the occurrence head.
 
         ``pos_weight = num_negatives / num_positives`` so that positive
-        (seizure-present) examples are up-weighted to compensate for the
-        heavy majority of background windows.
+        (seizure-present / preictal / ictal) examples are up-weighted to compensate
+        for background windows.
         """
-        counts = self.get_class_counts(indices)
-        # class 0 = non-seizure/background, anything else = seizure-present
-        neg = counts.get(0, 1)
-        pos = sum(v for k, v in counts.items() if k != 0) or 1
-        pw = torch.tensor([neg / pos], dtype=torch.float32)
+        col = self.df[self.label_col]
+        if indices is not None:
+            col = col.iloc[indices]
+
+        negatives = 0
+        positives = 0
+        for raw_label in col:
+            lbl_mapped = self.label_map.get(raw_label, raw_label)
+            is_bg = (lbl_mapped == 0 or str(raw_label).startswith("b"))
+            if is_bg:
+                negatives += 1
+            else:
+                positives += 1
+
+        negatives = max(1, negatives)
+        positives = max(1, positives)
+        ratio = float(negatives / positives)
+        # Cap pos_weight to a reasonable range (e.g. max 20.0) to prevent gradient explosion
+        ratio = min(ratio, 20.0)
+        pw = torch.tensor([ratio], dtype=torch.float32)
         if device is not None:
             pw = pw.to(device)
         return pw
