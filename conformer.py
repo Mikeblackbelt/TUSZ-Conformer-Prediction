@@ -333,15 +333,28 @@ class CausalEEGConformer(nn.Module):
         x: torch.Tensor,
         horizon_steps: Optional[int] = None,
         generate_horizon_tokens: bool = False,
+        use_horizon_context: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Input x: Preictal window EEG of shape (B, n_channels, n_samples)
-        
+
+        Args:
+            use_horizon_context: Curriculum gate for Tasks 2 & 3. When True, the
+                (detached) generated horizon tokens are concatenated onto the
+                preictal tokens before the final encoding that Tasks 2/3 pool
+                from. When False, Tasks 2/3 see the preictal window only. Keep
+                this False early in training -- the horizon generator's output
+                is close to noise until `pred_next_tokens` has converged, and
+                feeding noisy tokens into the classifiers destabilizes them.
+                The horizon tokens are always detached before concatenation so
+                classification gradients never flow back into the generator.
+
         Returns dictionary containing:
             - 'pred_next_tokens': Next token predictions for ground-truth preictal sequence (B, num_patches, embed_dim)
             - 'preictal_tokens': Ground truth preictal patch tokens extracted by ConvFrontEnd (B, num_patches, embed_dim)
             - 'generated_horizon_tokens': Autoregressively generated horizon tokens (B, horizon_steps, embed_dim)
-            - 'full_sequence_features': Encoded features of preictal/horizon sequence (B, total_seq_len, embed_dim)
+            - 'full_sequence_features': Encoded features Tasks 2/3 pool from -- preictal-only when
+              use_horizon_context=False, preictal+horizon when True (B, total_seq_len, embed_dim)
             - 'occurrence_logits': Seizure occurrence logits (B, 1) - Task 2 IF
             - 'onset_preds': Seizure onset offset predictions (B, 1) - Task 2 WHEN
             - 'type_logits': Seizure type classification logits (B, num_classes) - Task 3 TYPE
@@ -368,12 +381,17 @@ class CausalEEGConformer(nn.Module):
             else:
                 generated_horizon_tokens = pred_next_tokens
 
-        # 4. Full sequence = preictal + horizon, re-encoded together so Tasks 2 & 3
-        #    actually get to look at the generated horizon (this is the whole point
-        #    of the cascaded design: detect/time/type the seizure using the forecasted
-        #    signal, not just the preictal window that precedes it).
-        combined_tokens = torch.cat([preictal_tokens, generated_horizon_tokens], dim=1)
-        full_sequence_features = self.encode_tokens(combined_tokens)
+        # 4. Full sequence for Tasks 2 & 3. Detach the horizon tokens so
+        #    occurrence/timing/type gradients never flow back into the
+        #    next-token generator, and gate them out entirely early in
+        #    training (curriculum: caller passes use_horizon_context=False
+        #    until gen_loss has converged) since a barely-trained generator's
+        #    output is close to noise and destabilizes the classifiers.
+        if use_horizon_context:
+            combined_tokens = torch.cat([preictal_tokens, generated_horizon_tokens.detach()], dim=1)
+            full_sequence_features = self.encode_tokens(combined_tokens)
+        else:
+            full_sequence_features = preictal_features
 
         # Task 2: Seizure Occurrence (IF) and Timing (WHEN)
         occurrence_logits, onset_preds = self.occurrence_timing_head(full_sequence_features)
@@ -402,13 +420,15 @@ if __name__ == "__main__":
     dummy_eeg = torch.randn(B, C, T)
 
     model = CausalEEGConformer(n_channels=C, num_classes=3, default_horizon_tokens=8)
-    outputs = model(dummy_eeg)
-
+    outputs = model(dummy_eeg, use_horizon_context=False)
     print(f"Input EEG shape: {dummy_eeg.shape}")
     print(f"Preictal patch tokens shape: {outputs['preictal_tokens'].shape}")
     print(f"Next-token prediction shape: {outputs['pred_next_tokens'].shape}")
     print(f"Generated horizon tokens shape: {outputs['generated_horizon_tokens'].shape}")
-    print(f"Full sequence features shape: {outputs['full_sequence_features'].shape}")
+    print(f"Full sequence features shape (gate closed): {outputs['full_sequence_features'].shape}")
+
+    outputs_gated_open = model(dummy_eeg, use_horizon_context=True)
+    print(f"Full sequence features shape (gate open):   {outputs_gated_open['full_sequence_features'].shape}")
     print(f"Seizure occurrence logits shape (IF): {outputs['occurrence_logits'].shape}")
     print(f"Seizure onset predictions shape (WHEN): {outputs['onset_preds'].shape}")
     print(f"Seizure type logits shape (TYPE): {outputs['type_logits'].shape}")

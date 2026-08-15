@@ -12,6 +12,8 @@ import argparse
 import logging
 import math
 import os
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,6 +39,7 @@ def train_epoch(
     type_class_weights: torch.Tensor = None,
     timing_weight: float = 0.001,
     max_grad_norm: float = 1.0,
+    use_horizon_context: bool = True,
 ):
     model.train()
     total_loss = 0.0
@@ -71,7 +74,7 @@ def train_epoch(
 
         # --- AMP forward pass ---
         with torch.amp.autocast("cuda", enabled=use_amp):
-            outputs = model(windows, horizon_steps=horizon_tokens)
+            outputs = model(windows, horizon_steps=horizon_tokens, use_horizon_context=use_horizon_context)
 
             pred_next = outputs["pred_next_tokens"]
             preictal_tokens = outputs["preictal_tokens"]
@@ -159,6 +162,7 @@ def validate(
     occ_pos_weight: torch.Tensor = None,
     type_class_weights: torch.Tensor = None,
     timing_weight: float = 0.001,
+    use_horizon_context: bool = True,
 ):
     model.eval()
     total_loss = 0.0
@@ -185,7 +189,7 @@ def validate(
             onset_targets = torch.zeros_like(occ_targets)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            outputs = model(windows, horizon_steps=horizon_tokens)
+            outputs = model(windows, horizon_steps=horizon_tokens, use_horizon_context=use_horizon_context)
             pred_next = outputs["pred_next_tokens"]
             preictal_tokens = outputs["preictal_tokens"]
             occ_logits = outputs["occurrence_logits"]
@@ -217,6 +221,75 @@ def validate(
     return total_loss / num_batches, type_acc, occ_acc
 
 
+@torch.no_grad()
+def compute_confusion_matrix(
+    model: CausalEEGConformer,
+    val_loader,
+    device: torch.device,
+    num_classes: int,
+    use_amp: bool = False,
+    horizon_tokens: int = 10,
+    use_horizon_context: bool = True,
+) -> torch.Tensor:
+    """Runs the final model over val_loader and returns a (num_classes, num_classes)
+    confusion matrix for the Task 3 (type) predictions: rows = true label, cols = predicted."""
+    model.eval()
+    cm = torch.zeros(num_classes, num_classes, dtype=torch.long)
+
+    for batch in tqdm(val_loader, desc="Confusion Matrix"):
+        if isinstance(batch, (list, tuple)):
+            windows, targets = batch
+        else:
+            windows, targets = batch, {}
+
+        windows = windows.to(device, non_blocking=True)
+        labels = targets["label"] if isinstance(targets, dict) else targets
+        labels = labels.to(device, non_blocking=True)
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            outputs = model(
+                windows,
+                horizon_steps=horizon_tokens,
+                use_horizon_context=use_horizon_context,
+            )
+            type_preds = outputs["type_logits"].argmax(dim=-1)
+
+        for t, p in zip(labels.view(-1).tolist(), type_preds.view(-1).tolist()):
+            cm[t, p] += 1
+
+    return cm
+
+
+def log_confusion_matrix(cm: torch.Tensor, label_names: Optional[list] = None) -> None:
+    """Pretty-prints a confusion matrix (rows=true, cols=predicted) via `logger` and `print`."""
+    num_classes = cm.shape[0]
+    names = [str(n) for n in label_names] if label_names else [str(i) for i in range(num_classes)]
+    col_w = max(12, max(len(n) for n in names) + 2)
+
+    header = "\n" + "=" * 50 + "\nCONFUSION MATRIX (Validation Set)\nrows = True Label, cols = Predicted Label\n" + "=" * 50
+    header += "\n" + " " * col_w + "".join(f"{n:>{col_w}}" for n in names)
+    print(header)
+    logger.info(header)
+    for i, name in enumerate(names):
+        row = "".join(f"{cm[i, j].item():>{col_w}d}" for j in range(num_classes))
+        line = f"{name:>{col_w}}{row}"
+        print(line)
+        logger.info(line)
+
+    print("-" * 50)
+    # Per-class precision/recall
+    for i, name in enumerate(names):
+        support = cm[i, :].sum().item()
+        recall = cm[i, i].item() / support if support > 0 else 0.0
+        predicted_count = cm[:, i].sum().item()
+        precision = cm[i, i].item() / predicted_count if predicted_count > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        msg = f"  Class {name:>{col_w}}: support={support:5d} | precision={precision:.4f} | recall={recall:.4f} | F1={f1:.4f}"
+        print(msg)
+        logger.info(msg)
+    print("=" * 50 + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train 3-Head Causal EEG-Conformer Model.")
     parser.add_argument("--master-csv", required=True, help="Path to master CSV from build_master_file()")
@@ -224,7 +297,7 @@ def main():
     parser.add_argument("--stage", default="proc", choices=["raw", "proc"], help="Checkpoint stage ('raw' or 'proc')")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate (default: 5e-4, lowered from 1e-3 to reduce instability)")
     parser.add_argument("--term-value", default=None, help="Value in channel column to filter by")
     parser.add_argument("--window-samples", type=int, default=1000, help="Window sample length (default: 1000)")
     parser.add_argument("--embed-dim", type=int, default=128, help="Token embedding dimension (default: 128)")
@@ -245,7 +318,36 @@ def main():
         choices=["cosine", "onecycle"],
         help="LR scheduler: 'cosine' (CosineAnnealingWarmRestarts, default) or 'onecycle' (OneCycleLR)",
     )
-    parser.add_argument("--timing-weight", type=float, default=0.001, help="Loss weight for seizure onset timing loss (default: 0.001)")
+    parser.add_argument(
+        "--timing-weight",
+        type=float,
+        default=0.1,
+        help="Loss weight for seizure onset timing loss (default: 0.1)",
+    )
+    parser.add_argument(
+        "--timing-norm-seconds",
+        type=float,
+        default=300.0,
+        help="Divides the WHEN target (seconds to seizure onset) by this before training, forwarded to EEGWindowDataset (default: 300.0)",
+    )
+    parser.add_argument(
+        "--restart-period-epochs",
+        type=int,
+        default=2,
+        help="CosineAnnealingWarmRestarts T_0, expressed as a multiple of one epoch's steps (default: 2). "
+             "Raised from 1 epoch to reduce how often the LR spikes back up, which was correlated with grad-norm blowups.",
+    )
+    parser.add_argument(
+        "--horizon-gate-threshold",
+        type=float,
+        default=0.01,
+        help=(
+            "Curriculum gate: Task 2/3 heads only start seeing the (detached) generated horizon "
+            "tokens once the training gen_loss (next-token MSE) drops below this value. Before that, "
+            "the horizon tokens are close to noise and destabilize the classifiers. Once opened the "
+            "gate stays open (default: 0.01)."
+        ),
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
     args = parser.parse_args()
 
@@ -293,6 +395,7 @@ def main():
         binary_preictal=args.binary_preictal,
         cache_capacity=args.cache_capacity,
         num_workers=args.num_workers,
+        timing_norm=args.timing_norm_seconds,
     )
 
     num_classes = dataset.num_classes
@@ -352,19 +455,28 @@ def main():
         else:
             # CosineAnnealingWarmRestarts: first restart after T_0 steps,
             # then doubles each time (T_mult=2) — smooth decay with gentle restarts.
+            # T_0 spans --restart-period-epochs full epochs (not just 1) so LR spikes
+            # back up less often; frequent restarts were correlated with the grad-norm
+            # blowups / accuracy collapses observed in earlier runs.
+            t0 = steps_per_epoch * args.restart_period_epochs
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=steps_per_epoch,
+                T_0=t0,
                 T_mult=2,
                 eta_min=1e-6,
             )
-            logger.info(f"Scheduler: CosineAnnealingWarmRestarts | T_0={steps_per_epoch}, T_mult=2, eta_min=1e-6")
+            logger.info(f"Scheduler: CosineAnnealingWarmRestarts | T_0={t0} ({args.restart_period_epochs} epoch(s)), T_mult=2, eta_min=1e-6")
 
         if loaded_scheduler_state is not None:
             scheduler.load_state_dict(loaded_scheduler_state)
             logger.info("Scheduler state restored from checkpoint")
 
     logger.info(f"Gradient clipping max_norm={args.max_grad_norm}")
+
+    # Curriculum gate for feeding the generated horizon tokens into Tasks 2/3 (see
+    # --horizon-gate-threshold). Starts closed; opens permanently once train gen_loss
+    # drops below the threshold.
+    horizon_gate_open = False
 
     logger.info("Starting Multi-Task Training Loop...")
     for epoch in range(start_epoch, args.epochs + 1):
@@ -382,7 +494,16 @@ def main():
             type_class_weights=type_class_weights,
             timing_weight=args.timing_weight,
             max_grad_norm=args.max_grad_norm,
+            use_horizon_context=horizon_gate_open,
         )
+
+        if not horizon_gate_open and gen_l < args.horizon_gate_threshold:
+            horizon_gate_open = True
+            logger.info(
+                f"Horizon curriculum gate OPENED (gen_loss {gen_l:.4f} < threshold "
+                f"{args.horizon_gate_threshold}) — Tasks 2/3 will see horizon context from next epoch on."
+            )
+
         val_loss, val_type_acc, val_occ_acc = validate(
             model,
             val_loader,
@@ -392,6 +513,7 @@ def main():
             occ_pos_weight=occ_pos_weight,
             type_class_weights=type_class_weights,
             timing_weight=args.timing_weight,
+            use_horizon_context=horizon_gate_open,
         )
 
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -431,6 +553,20 @@ def main():
             f"(Gen: {gen_l:.4f}, Occ: {occ_l:.4f}, Timing: {time_l:.4f}, Type: {type_l:.4f}) | "
             f"Val Loss: {val_loss:.4f} | Val Occ Acc: {val_occ_acc * 100:.2f}% | Val Type Acc: {val_type_acc * 100:.2f}%"
         )
+
+    logger.info("Training complete. Computing final confusion matrix on validation set...")
+    idx_to_label = {v: k for k, v in dataset.label_map.items()}
+    label_names = [str(idx_to_label.get(i, i)) for i in range(num_classes)]
+    cm = compute_confusion_matrix(
+        model,
+        val_loader,
+        device,
+        num_classes,
+        use_amp=use_amp,
+        horizon_tokens=args.horizon_tokens,
+        use_horizon_context=horizon_gate_open,
+    )
+    log_confusion_matrix(cm, label_names=label_names)
 
 
 if __name__ == "__main__":

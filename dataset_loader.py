@@ -463,6 +463,8 @@ class EEGWindowDataset(Dataset):
         cache_capacity: int = 4,
         skip_missing_checkpoints: bool = True,
         return_dict: bool = True,
+        timing_norm: float = 300.0,  # seconds; onset_offset target is divided by this so its
+                                      # loss scale is O(1) instead of O(hundreds of seconds)
     ):
         master_csv = _normalize_dir_path(master_csv)
         checkpoint_dir = _normalize_dir_path(checkpoint_dir)
@@ -569,6 +571,7 @@ class EEGWindowDataset(Dataset):
 
         self.status_col = status_col
         self.return_dict = return_dict
+        self.timing_norm = timing_norm
         self._cache = SessionCache(checkpoint_dir, stage, capacity=cache_capacity)
         self.n_resized = 0  # counts windows that needed crop/pad, for sanity checks
 
@@ -634,7 +637,9 @@ class EEGWindowDataset(Dataset):
         weights = []
         for c in range(num_cls):
             cnt = counts.get(c, 1)  # avoid div-by-zero for unseen classes
-            weights.append(total / (num_cls * max(1, cnt)))
+            raw_w = (total / (num_cls * max(1, cnt))) ** 0.5  # smooth square-root scaling
+            w = min(raw_w, 3.0)  # cap max weight to 3.0 to prevent minority-class collapse
+            weights.append(w)
         t = torch.tensor(weights, dtype=torch.float32)
         if device is not None:
             t = t.to(device)
@@ -747,7 +752,8 @@ class EEGWindowDataset(Dataset):
         else:
             relative_onset = 0.0
 
-        onset_offset_t = torch.tensor(relative_onset, dtype=torch.float32)
+        relative_onset_clamped = min(relative_onset, self.timing_norm)
+        onset_offset_t = torch.tensor(relative_onset_clamped / self.timing_norm, dtype=torch.float32)
         status_t = torch.tensor(status_val, dtype=torch.long)
 
         targets = {
