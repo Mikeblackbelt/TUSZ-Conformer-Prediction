@@ -258,7 +258,8 @@ def _print_dataset_summary(
     initial       = counts.get("initial", 0)
     after_channel = counts.get("after_channel", initial)
     after_status  = counts.get("after_status", after_channel)
-    after_prefix  = counts.get("after_label_prefix", after_status)
+    after_ictal   = counts.get("after_ictal_filter", after_status)
+    after_prefix  = counts.get("after_label_prefix", after_ictal)
     after_conf    = counts.get("after_confidence", after_prefix)
     after_ckpt    = counts.get("after_checkpoints", after_conf)
     final         = after_ckpt
@@ -289,12 +290,13 @@ def _print_dataset_summary(
         funnel.add_column("Bar",     no_wrap=True)
 
         stages = [
-            ("Initial CSV rows",          initial),
-            ("After channel filter",       after_channel),
-            ("After status filter",        after_status),
-            ("After label-prefix filter",  after_prefix),
-            ("After confidence filter",    after_conf),
-            ("After checkpoint check",     after_ckpt),
+            ("Initial CSV rows",                 initial),
+            ("After channel filter",              after_channel),
+            ("After status filter",               after_status),
+            ("After ictal-validity filter",       after_ictal),
+            ("After label-prefix filter",         after_prefix),
+            ("After confidence filter",           after_conf),
+            ("After checkpoint check",            after_ckpt),
         ]
         prev = initial
         for label, count in stages:
@@ -345,12 +347,13 @@ def _print_dataset_summary(
         print("  Filter Funnel:")
         prev = initial
         for label, count in [
-            ("Initial CSV rows",          initial),
-            ("After channel filter",       after_channel),
-            ("After status filter",        after_status),
-            ("After label-prefix filter",  after_prefix),
-            ("After confidence filter",    after_conf),
-            ("After checkpoint check",     after_ckpt),
+            ("Initial CSV rows",                 initial),
+            ("After channel filter",              after_channel),
+            ("After status filter",               after_status),
+            ("After ictal-validity filter",       after_ictal),
+            ("After label-prefix filter",         after_prefix),
+            ("After confidence filter",           after_conf),
+            ("After checkpoint check",            after_ckpt),
         ]:
             dropped = prev - count
             bar = _bar(count, initial, width=20)
@@ -372,6 +375,50 @@ def _print_dataset_summary(
                 bar = _bar(cnt, final, width=20)
                 print(f"    {sp:<10} {cnt:>6}  {pct:5.1f}%  {bar}")
         print("═" * W + "\n")
+
+
+# Labels that are NOT ictal (used to identify pure ictal rows).
+# Background (b*), preictal (p*), postictal (q*), continuing (c*), exclusion (x*).
+_NON_ICTAL_PREFIXES: Tuple[str, ...] = ("b", "p", "q", "c", "x")
+
+
+def _build_valid_ictal_mask(
+    df: "pd.DataFrame",
+    label_col: str,
+    start_col: str,
+) -> "pd.Series":
+    """Return a boolean Series (same index as *df*) that is **False** for any
+    ictal row whose immediately preceding annotation (within the same session,
+    sorted by start_time) is **not** a preictal label (``p*``).
+
+    Non-ictal rows (background, preictal, postictal, continuing, exclusion)
+    are always True — they are handled by separate filters.
+
+    The check scans ALL preceding labels including ``c*``/``q*`` that will be
+    dropped later, so the pattern ``c{type} → {type}`` is caught correctly
+    before those rows disappear.
+
+    Rules enforced:
+    * Keep ictal if and only if the immediately preceding event is ``p*``.
+    * Ictals with no preceding event (first event in session) are dropped.
+    """
+    keep = pd.Series(True, index=df.index)
+
+    for _, grp in df.groupby("session_key", sort=False):
+        grp_sorted = grp.sort_values(start_col)
+        lbls = grp_sorted[label_col].astype(str).tolist()
+        orig_idx = grp_sorted.index.tolist()
+
+        prev_lbl: Optional[str] = None
+        for idx, lbl in zip(orig_idx, lbls):
+            is_ictal = not any(lbl.startswith(pf) for pf in _NON_ICTAL_PREFIXES)
+            if is_ictal:
+                # Only valid if immediately preceded by a preictal (p*) window
+                if prev_lbl is None or not prev_lbl.startswith("p"):
+                    keep[idx] = False
+            prev_lbl = lbl  # track ALL labels so c*→ictal is detected
+
+    return keep
 
 
 class EEGWindowDataset(Dataset):
@@ -398,7 +445,8 @@ class EEGWindowDataset(Dataset):
         status_col: str = "status",
         term_value: Optional[str] = None,
         exclude_status: Optional[set] = {0, 2},
-        exclude_prefix: Tuple[str, ...] = ("x",),
+        exclude_prefix: Tuple[str, ...] = ("x", "q", "c"),
+        exclude_ictal_without_preictal: bool = True,
         min_confidence: Optional[float] = None,
         binary_preictal: bool = False,
         session_key_fn: Callable[[str], str] = _default_session_key_fn,
@@ -434,18 +482,27 @@ class EEGWindowDataset(Dataset):
             self.df = self.df[~self.df[status_col].isin(exclude_status)].reset_index(drop=True)
         counts["after_status"] = len(self.df)
 
-        # 3. Label Exclusion Interval Filtering (Exclude x* exclusion intervals)
+        # 3. Ictal-validity filter: drop ictals not preceded by p* (preictal).
+        #    MUST run before exclude_prefix removes c*/q* rows so that the
+        #    pattern c{type}→{type} is still visible in the label sequence.
+        if exclude_ictal_without_preictal and label_col in self.df.columns:
+            keep_mask = _build_valid_ictal_mask(self.df, label_col, start_col)
+            self.df = self.df[keep_mask].reset_index(drop=True)
+        counts["after_ictal_filter"] = len(self.df)
+
+        # 4. Label Exclusion Prefix Filtering
+        #    Default excludes x* (exclusion intervals), q* (postictal), c* (continuing).
         if exclude_prefix and label_col in self.df.columns:
             pattern = "^(?:" + "|".join(exclude_prefix) + ")"
             self.df = self.df[~self.df[label_col].astype(str).str.contains(pattern, regex=True)].reset_index(drop=True)
         counts["after_label_prefix"] = len(self.df)
 
-        # 4. Confidence Filtering
+        # 5. Confidence Filtering
         if min_confidence is not None and confidence_col in self.df.columns:
             self.df = self.df[self.df[confidence_col] >= min_confidence].reset_index(drop=True)
         counts["after_confidence"] = len(self.df)
 
-        # 5. Filter out sessions whose checkpoint files do not exist on disk
+        # 6. Filter out sessions whose checkpoint files do not exist on disk
         if skip_missing_checkpoints:
             if not os.path.exists(checkpoint_dir):
                 print(f"Warning: Checkpoint directory '{checkpoint_dir}' does not exist on disk!")
@@ -464,6 +521,7 @@ class EEGWindowDataset(Dataset):
                 f"  - Initial CSV rows: {counts.get('initial')}\n"
                 f"  - After channel filter (term_value={term_value}): {counts.get('after_channel')}\n"
                 f"  - After status filter (exclude_status={exclude_status}): {counts.get('after_status')}\n"
+                f"  - After ictal-validity filter (exclude_ictal_without_preictal={exclude_ictal_without_preictal}): {counts.get('after_ictal_filter')}\n"
                 f"  - After label prefix filter (exclude_prefix={exclude_prefix}): {counts.get('after_label_prefix')}\n"
                 f"  - After confidence filter (min_confidence={min_confidence}): {counts.get('after_confidence')}\n"
                 f"  - After checkpoint verification in '{checkpoint_dir}': {counts.get('after_checkpoints', 0)}\n"
