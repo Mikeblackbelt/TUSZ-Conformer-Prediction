@@ -35,6 +35,7 @@ def train_epoch(
     horizon_tokens: int = 10,
     occ_pos_weight: torch.Tensor = None,
     type_class_weights: torch.Tensor = None,
+    timing_weight: float = 0.001,
     max_grad_norm: float = 1.0,
 ):
     model.train()
@@ -90,8 +91,8 @@ def train_epoch(
             # Task 3 (TYPE): Seizure Type CrossEntropy Loss
             type_loss = ce_criterion(type_logits, labels)
 
-            # Composite Multi-Task Loss
-            loss = gen_loss + occ_loss + 0.1 * timing_loss + type_loss
+            # Composite Multi-Task Loss (scaled timing loss to prevent dominating the gradients)
+            loss = gen_loss + occ_loss + timing_weight * timing_loss + type_loss
 
 
             if grad_accum_steps > 1:
@@ -157,6 +158,7 @@ def validate(
     horizon_tokens=10,
     occ_pos_weight: torch.Tensor = None,
     type_class_weights: torch.Tensor = None,
+    timing_weight: float = 0.001,
 ):
     model.eval()
     total_loss = 0.0
@@ -195,7 +197,7 @@ def validate(
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
             type_loss = ce_criterion(type_logits, labels)
 
-            loss = gen_loss + occ_loss + 0.1 * timing_loss + type_loss
+            loss = gen_loss + occ_loss + timing_weight * timing_loss + type_loss
 
 
 
@@ -243,6 +245,7 @@ def main():
         choices=["cosine", "onecycle"],
         help="LR scheduler: 'cosine' (CosineAnnealingWarmRestarts, default) or 'onecycle' (OneCycleLR)",
     )
+    parser.add_argument("--timing-weight", type=float, default=0.001, help="Loss weight for seizure onset timing loss (default: 0.001)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
     args = parser.parse_args()
 
@@ -371,6 +374,7 @@ def main():
             horizon_tokens=args.horizon_tokens,
             occ_pos_weight=occ_pos_weight,
             type_class_weights=type_class_weights,
+            timing_weight=args.timing_weight,
             max_grad_norm=args.max_grad_norm,
         )
         val_loss, val_type_acc, val_occ_acc = validate(
@@ -381,6 +385,7 @@ def main():
             horizon_tokens=args.horizon_tokens,
             occ_pos_weight=occ_pos_weight,
             type_class_weights=type_class_weights,
+            timing_weight=args.timing_weight,
         )
 
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
