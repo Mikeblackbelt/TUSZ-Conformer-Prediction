@@ -163,35 +163,80 @@ class NextTokenPredictionHead(nn.Module):
         return self.head(x)
 
 
-class SeizureOccurrenceAndTimingHead(nn.Module):
+class Conv1DClassifierBackbone(nn.Module):
     """
-    Task 2 Classifier: Determines IF a seizure occurs (occurrence) and WHEN (onset timing offset).
+    1D Convolutional Backbone for sequence feature classification.
+    Processes temporal feature maps (B, embed_dim, seq_len) with 1D convolutions,
+    residual connections, BatchNorm, and dual adaptive pooling (avg + max).
     """
 
-    def __init__(self, embed_dim: int = 128, hidden_dim: int = 256, dropout: float = 0.1):
+    def __init__(self, embed_dim: int = 128, hidden_dim: int = 256, dropout: float = 0.3):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.shared = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+        self.conv1 = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+
+        # Residual shortcut if dimensions change
+        self.shortcut = nn.Conv1d(embed_dim, hidden_dim, kernel_size=1) if embed_dim != hidden_dim else nn.Identity()
+
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input x: (B, seq_len, embed_dim)
+        Returns: (B, hidden_dim * 2) aggregated temporal feature representation
+        """
+        # Permute to (B, embed_dim, seq_len) for 1D convolution
+        h = x.permute(0, 2, 1)
+
+        res = self.shortcut(h)
+        h = F.gelu(self.bn1(self.conv1(h)))
+        h = self.drop(h)
+        h = F.gelu(self.bn2(self.conv2(h)) + res)
+        h = self.drop(h)
+
+        # Dual pooling (Average + Max) captures both global context and peak temporal signals
+        avg_feat = self.avg_pool(h).squeeze(-1)  # (B, hidden_dim)
+        max_feat = self.max_pool(h).squeeze(-1)  # (B, hidden_dim)
+
+        return torch.cat([avg_feat, max_feat], dim=-1)  # (B, hidden_dim * 2)
+
+
+class SeizureOccurrenceAndTimingHead(nn.Module):
+    """
+    Task 2 Classifier: 1D CNN-based head that determines IF a seizure occurs (occurrence)
+    and WHEN (onset timing offset).
+    """
+
+    def __init__(self, embed_dim: int = 128, hidden_dim: int = 256, dropout: float = 0.3):
+        super().__init__()
+        self.backbone = Conv1DClassifierBackbone(embed_dim=embed_dim, hidden_dim=hidden_dim, dropout=dropout)
+        feat_dim = hidden_dim * 2
+
+        self.occurrence_head = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
         )
-        # Binary logit for seizure occurrence (if)
-        self.occurrence_head = nn.Linear(hidden_dim, 1)
-        # Continuous onset time/token index offset (when)
-        self.timing_head = nn.Linear(hidden_dim, 1)
+        self.timing_head = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
     def forward(self, sequence_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Input: (B, seq_len, embed_dim)
         Returns:
-            occurrence_logits: (B, 1) - raw logit for seizure presence (sigmoid for prob)
+            occurrence_logits: (B, 1) - raw logit for seizure presence
             onset_preds: (B, 1) - predicted onset offset in seconds / token steps
         """
-        # Pool across sequence dimension: (B, embed_dim, seq_len) -> (B, embed_dim)
-        pooled = self.pool(sequence_features.permute(0, 2, 1)).squeeze(-1)
-        feat = self.shared(pooled)
-
+        feat = self.backbone(sequence_features)
         occ_logits = self.occurrence_head(feat)
         onset_preds = self.timing_head(feat)
         return occ_logits, onset_preds
@@ -199,18 +244,19 @@ class SeizureOccurrenceAndTimingHead(nn.Module):
 
 class SeizureTypeClassifierHead(nn.Module):
     """
-    Task 3 Classifier: Classifies the seizure by type (e.g. gnsz, fnsz, cpsz, absz, etc.)
-    downstream of seizure occurrence detection.
+    Task 3 Classifier: 1D CNN-based head that classifies seizure type downstream of detection.
     """
 
-    def __init__(self, embed_dim: int = 128, num_classes: int = 2, dropout: float = 0.1):
+    def __init__(self, embed_dim: int = 128, num_classes: int = 2, hidden_dim: int = 256, dropout: float = 0.3):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.backbone = Conv1DClassifierBackbone(embed_dim=embed_dim, hidden_dim=hidden_dim, dropout=dropout)
+        feat_dim = hidden_dim * 2
+
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(feat_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim, num_classes),
+            nn.Linear(hidden_dim // 2, num_classes),
         )
 
     def forward(self, sequence_features: torch.Tensor) -> torch.Tensor:
@@ -218,9 +264,8 @@ class SeizureTypeClassifierHead(nn.Module):
         Input: (B, seq_len, embed_dim)
         Returns: type_logits: (B, num_classes)
         """
-        pooled = self.pool(sequence_features.permute(0, 2, 1)).squeeze(-1)
-        type_logits = self.classifier(pooled)
-        return type_logits
+        feat = self.backbone(sequence_features)
+        return self.classifier(feat)
 
 
 class CausalEEGConformer(nn.Module):
