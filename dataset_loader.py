@@ -540,10 +540,13 @@ class EEGWindowDataset(Dataset):
         self.label_col = label_col
         self.patient_id_fn = patient_id_fn
 
+        # Keep original raw labels in a separate column before mapping
+        self.df["_raw_label"] = self.df[label_col].astype(str)
+
         # Label Mapping
         if binary_preictal:
             # Map preictal (p*) -> 1, all others -> 0
-            self.df[label_col] = self.df[label_col].astype(str).apply(lambda l: 1 if l.startswith("p") else 0)
+            self.df[label_col] = self.df["_raw_label"].apply(lambda l: 1 if l.startswith("p") else 0)
             label_map = {0: 0, 1: 1}
         elif label_map is None:
             uniq = sorted(self.df[label_col].dropna().unique().tolist())
@@ -621,20 +624,19 @@ class EEGWindowDataset(Dataset):
     ) -> torch.Tensor:
         """Scalar ``pos_weight`` for BCEWithLogitsLoss on the occurrence head.
 
-        ``pos_weight = num_negatives / num_positives`` so that positive
-        (seizure-present / preictal / ictal) examples are up-weighted to compensate
-        for background windows.
+        ``pos_weight = num_negatives / num_positives`` where positives are
+        preictal/ictal seizure windows and negatives are background windows.
         """
-        col = self.df[self.label_col]
+        raw_col = self.df["_raw_label"] if "_raw_label" in self.df.columns else self.df[self.label_col]
         if indices is not None:
-            col = col.iloc[indices]
+            raw_col = raw_col.iloc[indices]
 
         negatives = 0
         positives = 0
-        for raw_label in col:
-            lbl_mapped = self.label_map.get(raw_label, raw_label)
-            is_bg = (lbl_mapped == 0 or str(raw_label).startswith("b"))
-            if is_bg:
+        for raw_val in raw_col:
+            # Seizure is positive if original label starts with 'p' (preictal) or ictal seizure code, not 'b' (background) or '0'
+            s = str(raw_val)
+            if s == "0" or s.startswith("b"):
                 negatives += 1
             else:
                 positives += 1
@@ -681,8 +683,8 @@ class EEGWindowDataset(Dataset):
         stop_time = float(row[self.stop_col])
         window = self._slice_window(arr, start_time, stop_time)
 
-        raw_label = row[self.label_col]
-        label = self.label_map[raw_label]
+        raw_label = row["_raw_label"] if "_raw_label" in row else row[self.label_col]
+        label = self.label_map[row[self.label_col]] if row[self.label_col] in self.label_map else row[self.label_col]
         status_val = int(row[self.status_col]) if self.status_col in row else 1
 
         window_t = torch.from_numpy(np.ascontiguousarray(window)).float()
@@ -693,12 +695,13 @@ class EEGWindowDataset(Dataset):
 
         # Multi-task ground truth targets:
         # Occurrence (IF): 0 for non-seizure/background, 1 for preictal/ictal
-        has_seizure = 0.0 if (label == 0 or str(raw_label).startswith("b")) else 1.0
+        raw_str = str(raw_label)
+        has_seizure = 0.0 if (raw_str == "0" or raw_str.startswith("b")) else 1.0
         occurrence_t = torch.tensor(has_seizure, dtype=torch.float32)
 
         # Timing offset (WHEN): Relative onset time (in seconds) relative to the generated data window
         # For preictal windows (p*), relative onset is the distance/duration from preictal end to seizure start
-        if str(raw_label).startswith("p"):
+        if raw_str.startswith("p"):
             relative_onset = max(0.0, float(stop_time - start_time))
         elif has_seizure > 0:
             relative_onset = 0.0
