@@ -453,7 +453,7 @@ class EEGWindowDataset(Dataset):
         confidence_col: str = "confidence",
         status_col: str = "status",
         term_value: Optional[str] = None,
-        exclude_status: Optional[set] = {0, 2},
+        exclude_status: Optional[set] = {2},
         exclude_prefix: Tuple[str, ...] = ("x", "q", "c"),
         exclude_ictal_without_preictal: bool = True,
         min_confidence: Optional[float] = None,

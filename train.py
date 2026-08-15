@@ -261,33 +261,28 @@ def compute_confusion_matrix(
 
 
 def log_confusion_matrix(cm: torch.Tensor, label_names: Optional[list] = None) -> None:
-    """Pretty-prints a confusion matrix (rows=true, cols=predicted) via `logger` and `print`."""
+    """Pretty-prints a confusion matrix (rows=true, cols=predicted) via `logger`."""
     num_classes = cm.shape[0]
     names = [str(n) for n in label_names] if label_names else [str(i) for i in range(num_classes)]
-    col_w = max(12, max(len(n) for n in names) + 2)
+    col_w = max(10, max(len(n) for n in names) + 2)
 
-    header = "\n" + "=" * 50 + "\nCONFUSION MATRIX (Validation Set)\nrows = True Label, cols = Predicted Label\n" + "=" * 50
-    header += "\n" + " " * col_w + "".join(f"{n:>{col_w}}" for n in names)
-    print(header)
-    logger.info(header)
+    logger.info("=" * 60)
+    logger.info("CONFUSION MATRIX (Validation Set) - rows=True, cols=Predicted")
+    logger.info("=" * 60)
+    logger.info(" " * col_w + "".join(f"{n:>{col_w}}" for n in names))
     for i, name in enumerate(names):
         row = "".join(f"{cm[i, j].item():>{col_w}d}" for j in range(num_classes))
-        line = f"{name:>{col_w}}{row}"
-        print(line)
-        logger.info(line)
+        logger.info(f"{name:>{col_w}}{row}")
 
-    print("-" * 50)
-    # Per-class precision/recall
+    logger.info("-" * 60)
     for i, name in enumerate(names):
         support = cm[i, :].sum().item()
         recall = cm[i, i].item() / support if support > 0 else 0.0
         predicted_count = cm[:, i].sum().item()
         precision = cm[i, i].item() / predicted_count if predicted_count > 0 else 0.0
         f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-        msg = f"  Class {name:>{col_w}}: support={support:5d} | precision={precision:.4f} | recall={recall:.4f} | F1={f1:.4f}"
-        print(msg)
-        logger.info(msg)
-    print("=" * 50 + "\n")
+        logger.info(f"Class {name:>{col_w}}: support={support:5d} | precision={precision:.4f} | recall={recall:.4f} | F1={f1:.4f}")
+    logger.info("=" * 60)
 
 
 def main():
@@ -348,6 +343,11 @@ def main():
             "gate stays open (default: 0.01)."
         ),
     )
+    parser.add_argument(
+        "--exclude-status-0",
+        action="store_true",
+        help="Exclude status 0 generated interictal windows (default: False, keeps status 0 for more interictal data)",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
     args = parser.parse_args()
 
@@ -395,6 +395,7 @@ def main():
         binary_preictal=args.binary_preictal,
         cache_capacity=args.cache_capacity,
         num_workers=args.num_workers,
+        exclude_status={0, 2} if args.exclude_status_0 else {2},
         timing_norm=args.timing_norm_seconds,
     )
 
