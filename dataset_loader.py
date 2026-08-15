@@ -518,6 +518,63 @@ class EEGWindowDataset(Dataset):
         """Patient id per row, aligned with dataset indices."""
         return [self.patient_id_fn(k) for k in self.df["session_key"]]
 
+    def get_class_counts(self, indices: Optional[list] = None) -> dict:
+        """Return {class_idx: count} for the given row indices (or all rows).
+
+        Useful for computing inverse-frequency loss weights from the training
+        subset without re-reading the CSV.
+        """
+        col = self.df[self.label_col]
+        if indices is not None:
+            col = col.iloc[indices]
+        counts: dict = {}
+        for v in col:
+            counts[v] = counts.get(v, 0) + 1
+        return counts
+
+    def class_weights_tensor(
+        self,
+        indices: Optional[list] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Inverse-frequency weight tensor for CrossEntropyLoss.
+
+        Returns a 1-D float tensor of length ``num_classes`` where
+        ``weights[c] = total / (num_classes * count[c])``, which is the
+        standard sklearn-style balanced weight.  Missing classes get weight 1.
+        """
+        counts = self.get_class_counts(indices)
+        total = sum(counts.values())
+        num_cls = self.num_classes
+        weights = []
+        for c in range(num_cls):
+            cnt = counts.get(c, 1)  # avoid div-by-zero for unseen classes
+            weights.append(total / (num_cls * cnt))
+        t = torch.tensor(weights, dtype=torch.float32)
+        if device is not None:
+            t = t.to(device)
+        return t
+
+    def occ_pos_weight(
+        self,
+        indices: Optional[list] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Scalar ``pos_weight`` for BCEWithLogitsLoss on the occurrence head.
+
+        ``pos_weight = num_negatives / num_positives`` so that positive
+        (seizure-present) examples are up-weighted to compensate for the
+        heavy majority of background windows.
+        """
+        counts = self.get_class_counts(indices)
+        # class 0 = non-seizure/background, anything else = seizure-present
+        neg = counts.get(0, 1)
+        pos = sum(v for k, v in counts.items() if k != 0) or 1
+        pw = torch.tensor([neg / pos], dtype=torch.float32)
+        if device is not None:
+            pw = pw.to(device)
+        return pw
+
     def _slice_window(self, arr: np.ndarray, start_time: float, stop_time: float) -> np.ndarray:
         start_idx = int(round(start_time * self.sampling_rate))
         stop_idx = int(round(stop_time * self.sampling_rate))

@@ -241,7 +241,7 @@ class CausalEEGConformer(nn.Module):
         ffn_dim: int = 512,
         temp_kernel: int = 25,
         stride: int = 10,
-        dropout: float = 0.1,
+        dropout: float = 0.3,
         max_len: int = 2000,
         num_classes: int = 2,
         default_horizon_tokens: int = 10,

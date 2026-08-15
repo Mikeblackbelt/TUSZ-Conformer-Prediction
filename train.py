@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 from tqdm import tqdm
 
 from dataset_loader import build_dataloaders
@@ -32,6 +33,9 @@ def train_epoch(
     scheduler=None,
     grad_accum_steps: int = 1,
     horizon_tokens: int = 10,
+    occ_pos_weight: torch.Tensor = None,
+    type_class_weights: torch.Tensor = None,
+    max_grad_norm: float = 1.0,
 ):
     model.train()
     total_loss = 0.0
@@ -40,11 +44,12 @@ def train_epoch(
     total_timing_loss = 0.0
     total_type_loss = 0.0
 
-    bce_criterion = nn.BCEWithLogitsLoss()
-    ce_criterion = nn.CrossEntropyLoss()
+    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
+    ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
     num_batches = len(train_loader)
     use_amp = scaler is not None and device.type == "cuda"
 
+    grad_norm: torch.Tensor = torch.tensor(float("nan"))
     pbar = tqdm(train_loader, desc="Training")
     for i, batch in enumerate(pbar, start=1):
         if isinstance(batch, (list, tuple)):
@@ -100,12 +105,20 @@ def train_epoch(
             loss.backward()
 
         if i % grad_accum_steps == 0 or i == num_batches:
+            # Gradient clipping (unscale first when using AMP)
+            if use_amp:
+                scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
             if use_amp:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
+
             optimizer.zero_grad(set_to_none=True)
+
+            # Scheduler step AFTER optimizer step (fixes PyTorch ordering warning)
             if scheduler is not None:
                 scheduler.step()
 
@@ -116,12 +129,14 @@ def train_epoch(
         total_timing_loss += timing_loss.item()
         total_type_loss += type_loss.item()
 
+        gnorm_val = grad_norm.item() if not torch.isnan(grad_norm) else float("nan")
         pbar.set_postfix(
             loss=f"{loss_val:.4f}",
             gen=f"{gen_loss.item():.4f}",
             occ=f"{occ_loss.item():.4f}",
             time=f"{timing_loss.item():.4f}",
             type=f"{type_loss.item():.4f}",
+            gnorm=f"{gnorm_val:.2f}",
         )
 
     return (
@@ -134,14 +149,22 @@ def train_epoch(
 
 
 @torch.no_grad()
-def validate(model: CausalEEGConformer, val_loader, device: torch.device, use_amp=False, horizon_tokens=10):
+def validate(
+    model: CausalEEGConformer,
+    val_loader,
+    device: torch.device,
+    use_amp=False,
+    horizon_tokens=10,
+    occ_pos_weight: torch.Tensor = None,
+    type_class_weights: torch.Tensor = None,
+):
     model.eval()
     total_loss = 0.0
     correct_type = 0
     correct_occ = 0
     total_samples = 0
-    ce_criterion = nn.CrossEntropyLoss()
-    bce_criterion = nn.BCEWithLogitsLoss()
+    ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
+    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
 
     for batch in tqdm(val_loader, desc="Validating"):
         if isinstance(batch, (list, tuple)):
@@ -213,7 +236,14 @@ def main():
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile()")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP mixed-precision training")
     parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--use-scheduler", action="store_true", help="Enable OneCycleLR scheduler")
+    parser.add_argument("--use-scheduler", action="store_true", help="Enable LR scheduler")
+    parser.add_argument(
+        "--scheduler-type",
+        default="cosine",
+        choices=["cosine", "onecycle"],
+        help="LR scheduler: 'cosine' (CosineAnnealingWarmRestarts, default) or 'onecycle' (OneCycleLR)",
+    )
+    parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -282,22 +312,50 @@ def main():
         logger.info("Compiling model with torch.compile()...")
         model = torch.compile(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     if loaded_optimizer_state is not None:
         optimizer.load_state_dict(loaded_optimizer_state)
 
     use_amp = not args.no_amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
+    # Compute class-balance weights from the training split indices
+    from dataset_loader import split_by_column
+    _subsets = split_by_column(dataset)
+    _train_indices = _subsets["train"].indices if hasattr(_subsets.get("train", None), "indices") else None
+    type_class_weights = dataset.class_weights_tensor(indices=_train_indices, device=device)
+    occ_pos_weight = dataset.occ_pos_weight(indices=_train_indices, device=device)
+    logger.info(f"Type class weights: {type_class_weights.tolist()}")
+    logger.info(f"Occurrence pos_weight: {occ_pos_weight.item():.4f}")
+
     scheduler = None
     if args.use_scheduler:
-        steps_per_epoch = len(train_loader) // args.grad_accum_steps
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=args.lr,
-            epochs=args.epochs - start_epoch + 1,
-            steps_per_epoch=steps_per_epoch,
-        )
+        # Use ceil so total_steps matches the actual scheduler.step() call count:
+        # the loop fires on i%grad_accum==0 (floor steps) AND on i==num_batches
+        # for any leftover batch, giving ceil(len/accum) steps per epoch.
+        steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
+        remaining_epochs = args.epochs - start_epoch + 1
+        total_steps = steps_per_epoch * remaining_epochs
+
+        if args.scheduler_type == "onecycle":
+            scheduler = OneCycleLR(
+                optimizer,
+                max_lr=args.lr,
+                total_steps=total_steps,
+            )
+            logger.info(f"Scheduler: OneCycleLR | total_steps={total_steps}")
+        else:
+            # CosineAnnealingWarmRestarts: first restart after T_0 steps,
+            # then doubles each time (T_mult=2) — smooth decay with gentle restarts.
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=steps_per_epoch,
+                T_mult=2,
+                eta_min=1e-6,
+            )
+            logger.info(f"Scheduler: CosineAnnealingWarmRestarts | T_0={steps_per_epoch}, T_mult=2, eta_min=1e-6")
+
+    logger.info(f"Gradient clipping max_norm={args.max_grad_norm}")
 
     logger.info("Starting Multi-Task Training Loop...")
     for epoch in range(start_epoch, args.epochs + 1):
@@ -311,9 +369,18 @@ def main():
             scheduler=scheduler,
             grad_accum_steps=args.grad_accum_steps,
             horizon_tokens=args.horizon_tokens,
+            occ_pos_weight=occ_pos_weight,
+            type_class_weights=type_class_weights,
+            max_grad_norm=args.max_grad_norm,
         )
         val_loss, val_type_acc, val_occ_acc = validate(
-            model, val_loader, device, use_amp=use_amp, horizon_tokens=args.horizon_tokens
+            model,
+            val_loader,
+            device,
+            use_amp=use_amp,
+            horizon_tokens=args.horizon_tokens,
+            occ_pos_weight=occ_pos_weight,
+            type_class_weights=type_class_weights,
         )
 
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -349,7 +416,7 @@ def main():
         logger.info(
             f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} "
             f"(Gen: {gen_l:.4f}, Occ: {occ_l:.4f}, Timing: {time_l:.4f}, Type: {type_l:.4f}) | "
-            f"Val Loss: {val_loss:.4f} | Val Occ Acc: {val_occ_acc * 100:.2f}% | Val Type Acc: {type_acc * 100 if 'type_acc' in locals() else val_type_acc * 100:.2f}%"
+            f"Val Loss: {val_loss:.4f} | Val Occ Acc: {val_occ_acc * 100:.2f}% | Val Type Acc: {val_type_acc * 100:.2f}%"
         )
 
 
