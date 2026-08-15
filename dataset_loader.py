@@ -52,6 +52,7 @@ is hardcoded.
 
 from __future__ import annotations
 
+import bisect
 import os
 from collections import OrderedDict
 from typing import Callable, Optional, Tuple
@@ -461,6 +462,7 @@ class EEGWindowDataset(Dataset):
         patient_id_fn: Callable[[str], str] = _default_patient_id_fn,
         cache_capacity: int = 4,
         skip_missing_checkpoints: bool = True,
+        return_dict: bool = True,
     ):
         master_csv = _normalize_dir_path(master_csv)
         checkpoint_dir = _normalize_dir_path(checkpoint_dir)
@@ -566,9 +568,20 @@ class EEGWindowDataset(Dataset):
         self.num_classes = len(set(label_map.values()))
 
         self.status_col = status_col
-        self.return_dict = True
+        self.return_dict = return_dict
         self._cache = SessionCache(checkpoint_dir, stage, capacity=cache_capacity)
         self.n_resized = 0  # counts windows that needed crop/pad, for sanity checks
+
+        # Per-session sorted list of ictal (seizure) onset times, from the final
+        # filtered rows. Used in __getitem__ to compute the real "WHEN" target for
+        # preictal windows: how long from this window's end until the seizure
+        # actually starts -- not just how long the window itself is.
+        self._session_ictal_onsets: dict = {}
+        is_ictal = ~self.df["_raw_label"].astype(str).apply(
+            lambda l: any(l.startswith(pf) for pf in _NON_ICTAL_PREFIXES)
+        )
+        for session_key, grp in self.df[is_ictal].groupby("session_key"):
+            self._session_ictal_onsets[session_key] = sorted(grp[start_col].astype(float).tolist())
 
         # --- Live terminal dashboard -----------------------------------------
         split_series = self.df[split_col] if split_col in self.df.columns else None
@@ -720,7 +733,15 @@ class EEGWindowDataset(Dataset):
         # Timing offset (WHEN): Relative onset time (in seconds) relative to the generated data window
         # For preictal windows (p*), relative onset is the distance/duration from preictal end to seizure start
         if raw_str.startswith("p"):
-            relative_onset = max(0.0, float(stop_time - start_time))
+            onsets = self._session_ictal_onsets.get(session_key, [])
+            pos = bisect.bisect_left(onsets, stop_time)
+            if pos < len(onsets):
+                relative_onset = max(0.0, onsets[pos] - stop_time)
+            else:
+                # Shouldn't normally happen (the ictal-validity filter requires every
+                # kept ictal event be immediately preceded by a p* window), but fall
+                # back to the window's own duration rather than crashing.
+                relative_onset = max(0.0, float(stop_time - start_time))
         elif has_seizure > 0:
             relative_onset = 0.0
         else:
@@ -875,6 +896,9 @@ if __name__ == "__main__":
     print(f"classes: {dataset.label_map}")
     print(f"train batches: {len(train_loader)}, val batches: {len(val_loader)}")
 
-    windows, labels = next(iter(train_loader))
-    print(f"batch windows: {tuple(windows.shape)}, labels: {tuple(labels.shape)}")
+    windows, targets = next(iter(train_loader))
+    if isinstance(targets, dict):
+        print(f"batch windows: {tuple(windows.shape)}, labels: {tuple(targets['label'].shape)}")
+    else:
+        print(f"batch windows: {tuple(windows.shape)}, labels: {tuple(targets.shape)}")
     print(f"windows resized (crop/pad) so far: {dataset.n_resized}")

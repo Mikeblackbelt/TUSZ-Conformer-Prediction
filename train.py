@@ -271,11 +271,13 @@ def main():
 
     loaded_state_dict = None
     loaded_optimizer_state = None
+    loaded_scheduler_state = None
     if ckpt_path is not None and os.path.isfile(ckpt_path):
         logger.info(f"Loading checkpoint {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=device)
         loaded_state_dict = checkpoint["model_state_dict"]
         loaded_optimizer_state = checkpoint["optimizer_state_dict"]
+        loaded_scheduler_state = checkpoint.get("scheduler_state_dict")
         start_epoch = checkpoint.get("epoch", 1) + 1
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
 
@@ -358,6 +360,10 @@ def main():
             )
             logger.info(f"Scheduler: CosineAnnealingWarmRestarts | T_0={steps_per_epoch}, T_mult=2, eta_min=1e-6")
 
+        if loaded_scheduler_state is not None:
+            scheduler.load_state_dict(loaded_scheduler_state)
+            logger.info("Scheduler state restored from checkpoint")
+
     logger.info(f"Gradient clipping max_norm={args.max_grad_norm}")
 
     logger.info("Starting Multi-Task Training Loop...")
@@ -395,6 +401,7 @@ def main():
                 "epoch": epoch,
                 "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_type_acc": val_type_acc,
@@ -411,6 +418,7 @@ def main():
                     "epoch": epoch,
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
                     "best_val_loss": best_val_loss,

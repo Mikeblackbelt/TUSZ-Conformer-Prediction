@@ -351,9 +351,12 @@ class CausalEEGConformer(nn.Module):
         # 1. Front-end patch extraction of preictal phase window
         preictal_tokens = self.front_end(x)  # (B, N_pre, embed_dim)
 
-        # 2. Parallel causal encoder pass over preictal window
-        full_sequence_features = self.encode_tokens(preictal_tokens)
-        pred_next_tokens = self.pred_head(full_sequence_features)  # (B, N_pre, embed_dim)
+        # 2. Causal encoder pass over the preictal window ONLY. This is what
+        #    Task 1's next-token loss is scored against, so it must stay scoped
+        #    to preictal_tokens (not the horizon) or the teacher-forcing target
+        #    alignment in train.py's gen_loss breaks.
+        preictal_features = self.encode_tokens(preictal_tokens)
+        pred_next_tokens = self.pred_head(preictal_features)  # (B, N_pre, embed_dim)
 
         # 3. Horizon tokens: Autoregressive generation if explicitly requested, otherwise parallel slice
         if generate_horizon_tokens:
@@ -364,6 +367,13 @@ class CausalEEGConformer(nn.Module):
                 generated_horizon_tokens = pred_next_tokens[:, -steps:, :]
             else:
                 generated_horizon_tokens = pred_next_tokens
+
+        # 4. Full sequence = preictal + horizon, re-encoded together so Tasks 2 & 3
+        #    actually get to look at the generated horizon (this is the whole point
+        #    of the cascaded design: detect/time/type the seizure using the forecasted
+        #    signal, not just the preictal window that precedes it).
+        combined_tokens = torch.cat([preictal_tokens, generated_horizon_tokens], dim=1)
+        full_sequence_features = self.encode_tokens(combined_tokens)
 
         # Task 2: Seizure Occurrence (IF) and Timing (WHEN)
         occurrence_logits, onset_preds = self.occurrence_timing_head(full_sequence_features)
