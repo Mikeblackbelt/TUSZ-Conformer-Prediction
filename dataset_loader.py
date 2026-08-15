@@ -377,6 +377,14 @@ def _print_dataset_summary(
         print("═" * W + "\n")
 
 
+def _is_background_label(raw_val) -> bool:
+    """Return True if raw_val represents a background / non-seizure window."""
+    s = str(raw_val).strip().lower()
+    if s in ("0", "0.0", "-1", "none", "nan", "null", "") or s.startswith("b") or s.startswith("0"):
+        return True
+    return False
+
+
 # Labels that are NOT ictal (used to identify pure ictal rows).
 # Background (b*), preictal (p*), postictal (q*), continuing (c*), exclusion (x*).
 _NON_ICTAL_PREFIXES: Tuple[str, ...] = ("b", "p", "q", "c", "x")
@@ -540,6 +548,8 @@ class EEGWindowDataset(Dataset):
         self.label_col = label_col
         self.patient_id_fn = patient_id_fn
 
+        self.binary_preictal = binary_preictal
+
         # Keep original raw labels in a separate column before mapping
         self.df["_raw_label"] = self.df[label_col].astype(str)
 
@@ -627,19 +637,24 @@ class EEGWindowDataset(Dataset):
         ``pos_weight = num_negatives / num_positives`` where positives are
         preictal/ictal seizure windows and negatives are background windows.
         """
-        raw_col = self.df["_raw_label"] if "_raw_label" in self.df.columns else self.df[self.label_col]
-        if indices is not None:
-            raw_col = raw_col.iloc[indices]
+        if getattr(self, "binary_preictal", False):
+            col = self.df[self.label_col]
+            if indices is not None:
+                col = col.iloc[indices]
+            positives = int((col == 1).sum())
+            negatives = int((col == 0).sum())
+        else:
+            raw_col = self.df["_raw_label"] if "_raw_label" in self.df.columns else self.df[self.label_col]
+            if indices is not None:
+                raw_col = raw_col.iloc[indices]
 
-        negatives = 0
-        positives = 0
-        for raw_val in raw_col:
-            # Seizure is positive if original label starts with 'p' (preictal) or ictal seizure code, not 'b' (background) or '0'
-            s = str(raw_val)
-            if s == "0" or s.startswith("b"):
-                negatives += 1
-            else:
-                positives += 1
+            negatives = 0
+            positives = 0
+            for raw_val in raw_col:
+                if _is_background_label(raw_val):
+                    negatives += 1
+                else:
+                    positives += 1
 
         negatives = max(1, negatives)
         positives = max(1, positives)
@@ -696,7 +711,10 @@ class EEGWindowDataset(Dataset):
         # Multi-task ground truth targets:
         # Occurrence (IF): 0 for non-seizure/background, 1 for preictal/ictal
         raw_str = str(raw_label)
-        has_seizure = 0.0 if (raw_str == "0" or raw_str.startswith("b")) else 1.0
+        if getattr(self, "binary_preictal", False):
+            has_seizure = 1.0 if label == 1 else 0.0
+        else:
+            has_seizure = 0.0 if _is_background_label(raw_label) else 1.0
         occurrence_t = torch.tensor(has_seizure, dtype=torch.float32)
 
         # Timing offset (WHEN): Relative onset time (in seconds) relative to the generated data window
