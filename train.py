@@ -56,6 +56,7 @@ def train_epoch(
         if isinstance(targets, dict):
             labels = targets["label"].to(device, non_blocking=True)
             occ_targets = targets["occurrence"].to(device, non_blocking=True).unsqueeze(-1)
+            # Relative onset time target (in seconds relative to generated data)
             onset_targets = targets["onset_offset"].to(device, non_blocking=True).unsqueeze(-1)
         else:
             labels = targets.to(device, non_blocking=True)
@@ -78,17 +79,19 @@ def train_epoch(
             # Task 2 (IF): Seizure Occurrence BCE Loss
             occ_loss = bce_criterion(occ_logits, occ_targets)
 
-            # Task 2 (WHEN): Seizure Onset Timing MSE Loss
-            timing_loss = F.mse_loss(onset_preds, onset_targets)
+            # Task 2 (WHEN): Seizure Onset Timing Smooth L1 (Huber) Loss (relative seconds)
+            timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
 
             # Task 3 (TYPE): Seizure Type CrossEntropy Loss
             type_loss = ce_criterion(type_logits, labels)
 
             # Composite Multi-Task Loss
-            loss = gen_loss + 0.5 * occ_loss + 0.1 * timing_loss + 1.0 * type_loss
+            loss = gen_loss + occ_loss + 0.1 * timing_loss + type_loss
+
 
             if grad_accum_steps > 1:
                 loss = loss / grad_accum_steps
+
 
         # --- AMP backward pass ---
         if use_amp:
@@ -166,10 +169,12 @@ def validate(model: CausalEEGConformer, val_loader, device: torch.device, use_am
 
             gen_loss = F.mse_loss(pred_next[:, :-1, :], preictal_tokens[:, 1:, :])
             occ_loss = bce_criterion(occ_logits, occ_targets)
-            timing_loss = F.mse_loss(onset_preds, onset_targets)
+            timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
             type_loss = ce_criterion(type_logits, labels)
 
-            loss = gen_loss + 0.5 * occ_loss + 0.1 * timing_loss + 1.0 * type_loss
+            loss = gen_loss + occ_loss + 0.1 * timing_loss + type_loss
+
+
 
         total_loss += loss.item()
 

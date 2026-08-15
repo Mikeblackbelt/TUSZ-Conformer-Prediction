@@ -205,32 +205,23 @@ class SessionCache:
         return arr
 
 
+def _normalize_dir_path(path: str) -> str:
+    r"""Normalizes path strings across OS environments (e.g. C:\... -> /mnt/c/... under WSL)."""
+    if not path:
+        return path
+
+    path_str = str(path).strip()
+    if os.name == "posix" and len(path_str) >= 2 and path_str[1] == ":":
+        drive_letter = path_str[0].lower()
+        rest = path_str[2:].replace("\\", "/")
+        return f"/mnt/{drive_letter}{rest}"
+    return path_str
+
+
 class EEGWindowDataset(Dataset):
     """One example = one labeled time window from the master CSV.
 
-    See module docstring for the full assumption list. Key args:
-
-        master_csv: path to the CSV from `build_master_file()`.
-        checkpoint_dir: directory holding `{session_key}_{stage}.parquet`
-            (preferred) or `.npz`/`.npy` (legacy fallback).
-        stage: "raw" or "proc" -- which checkpoint set to read from
-            (use "proc" if you ran `--create-montage`).
-        sampling_rate: Hz, used to convert start/stop_time seconds
-            into sample indices.
-        window_samples: fixed output length in samples. Longer windows
-            are center-cropped, shorter ones zero-padded (both counted
-            in `self.n_resized`).
-        label_map: dict mapping raw `label` values to integer class
-            labels. If None, inferred by sorting unique values seen --
-            fine for a first pass, but pin it explicitly once you know
-            your label set so class indices stay stable across runs.
-        term_value: keep only rows where `channel == term_value`
-            (default "TERM"). Pass None to keep all rows regardless
-            of channel.
-        exclude_status: rows whose `status` value is in this set are
-            dropped (default: none dropped).
-        min_confidence: rows with `confidence` below this are dropped
-            (default: no filtering).
+    See module docstring for the full assumption list.
     """
 
     def __init__(
@@ -259,7 +250,13 @@ class EEGWindowDataset(Dataset):
         cache_capacity: int = 4,
         skip_missing_checkpoints: bool = True,
     ):
+        master_csv = _normalize_dir_path(master_csv)
+        checkpoint_dir = _normalize_dir_path(checkpoint_dir)
+
         self.df = pd.read_csv(master_csv)
+        initial_count = len(self.df)
+        counts = {"initial": initial_count}
+
         required = [edf_path_col, start_col, stop_col, label_col]
         missing = [c for c in required if c not in self.df.columns]
         if missing:
@@ -274,35 +271,50 @@ class EEGWindowDataset(Dataset):
         # 1. Channel Montage Filtering
         if term_value is not None and channel_col in self.df.columns:
             self.df = self.df[self.df[channel_col] == term_value].reset_index(drop=True)
+        counts["after_channel"] = len(self.df)
 
         # 2. Status Filtering (Exclude collapsed status 0 and 2 from TUH_preprocess)
         if exclude_status and status_col in self.df.columns:
             self.df = self.df[~self.df[status_col].isin(exclude_status)].reset_index(drop=True)
+        counts["after_status"] = len(self.df)
 
         # 3. Label Exclusion Interval Filtering (Exclude x* exclusion intervals)
         if exclude_prefix and label_col in self.df.columns:
             pattern = "^(?:" + "|".join(exclude_prefix) + ")"
             self.df = self.df[~self.df[label_col].astype(str).str.contains(pattern, regex=True)].reset_index(drop=True)
+        counts["after_label_prefix"] = len(self.df)
 
         # 4. Confidence Filtering
         if min_confidence is not None and confidence_col in self.df.columns:
             self.df = self.df[self.df[confidence_col] >= min_confidence].reset_index(drop=True)
+        counts["after_confidence"] = len(self.df)
 
         # 5. Filter out sessions whose checkpoint files do not exist on disk
-        if skip_missing_checkpoints and os.path.exists(checkpoint_dir):
+        if skip_missing_checkpoints:
+            if not os.path.exists(checkpoint_dir):
+                print(f"Warning: Checkpoint directory '{checkpoint_dir}' does not exist on disk!")
             tqdm.pandas(desc="Verifying checkpoint files")
             valid_mask = self.df["session_key"].progress_apply(
                 lambda k: _find_checkpoint_file(checkpoint_dir, k, stage) is not None
             )
-            initial_count = len(self.df)
+            initial_check = len(self.df)
             self.df = self.df[valid_mask].reset_index(drop=True)
-            print(f"Skipped {initial_count - len(self.df)} rows missing checkpoints. {len(self.df)} valid rows retained.")
+            counts["after_checkpoints"] = len(self.df)
+            print(f"Skipped {initial_check - len(self.df)} rows missing checkpoints in '{checkpoint_dir}'. {len(self.df)} valid rows retained.")
 
         if len(self.df) == 0:
-            raise ValueError(
-                "No rows left after filtering -- check term_value/exclude_status/"
-                "min_confidence against your actual data."
+            msg = (
+                f"No rows left after filtering! Filter breakdown:\n"
+                f"  - Initial CSV rows: {counts.get('initial')}\n"
+                f"  - After channel filter (term_value={term_value}): {counts.get('after_channel')}\n"
+                f"  - After status filter (exclude_status={exclude_status}): {counts.get('after_status')}\n"
+                f"  - After label prefix filter (exclude_prefix={exclude_prefix}): {counts.get('after_label_prefix')}\n"
+                f"  - After confidence filter (min_confidence={min_confidence}): {counts.get('after_confidence')}\n"
+                f"  - After checkpoint verification in '{checkpoint_dir}': {counts.get('after_checkpoints', 0)}\n"
+                f"Check your filter options or WSL path formats."
             )
+            raise ValueError(msg)
+
 
         self.checkpoint_dir = checkpoint_dir
         self.stage = stage
@@ -386,8 +398,16 @@ class EEGWindowDataset(Dataset):
         has_seizure = 0.0 if (label == 0 or str(raw_label).startswith("b")) else 1.0
         occurrence_t = torch.tensor(has_seizure, dtype=torch.float32)
 
-        # Timing offset (WHEN): duration/start offset of preictal phase
-        onset_offset_t = torch.tensor(start_time, dtype=torch.float32)
+        # Timing offset (WHEN): Relative onset time (in seconds) relative to the generated data window
+        # For preictal windows (p*), relative onset is the distance/duration from preictal end to seizure start
+        if str(raw_label).startswith("p"):
+            relative_onset = max(0.0, float(stop_time - start_time))
+        elif has_seizure > 0:
+            relative_onset = 0.0
+        else:
+            relative_onset = 0.0
+
+        onset_offset_t = torch.tensor(relative_onset, dtype=torch.float32)
         status_t = torch.tensor(status_val, dtype=torch.long)
 
         targets = {
@@ -396,6 +416,7 @@ class EEGWindowDataset(Dataset):
             "onset_offset": onset_offset_t,
             "status": status_t,
         }
+
         return window_t, targets
 
 

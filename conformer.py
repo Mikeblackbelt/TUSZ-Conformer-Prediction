@@ -332,6 +332,7 @@ class CausalEEGConformer(nn.Module):
         self,
         x: torch.Tensor,
         horizon_steps: Optional[int] = None,
+        generate_horizon_tokens: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Input x: Preictal window EEG of shape (B, n_channels, n_samples)
@@ -340,25 +341,29 @@ class CausalEEGConformer(nn.Module):
             - 'pred_next_tokens': Next token predictions for ground-truth preictal sequence (B, num_patches, embed_dim)
             - 'preictal_tokens': Ground truth preictal patch tokens extracted by ConvFrontEnd (B, num_patches, embed_dim)
             - 'generated_horizon_tokens': Autoregressively generated horizon tokens (B, horizon_steps, embed_dim)
-            - 'full_sequence_features': Encoded features of combined preictal + generated horizon sequence (B, total_seq_len, embed_dim)
+            - 'full_sequence_features': Encoded features of preictal/horizon sequence (B, total_seq_len, embed_dim)
             - 'occurrence_logits': Seizure occurrence logits (B, 1) - Task 2 IF
             - 'onset_preds': Seizure onset offset predictions (B, 1) - Task 2 WHEN
             - 'type_logits': Seizure type classification logits (B, num_classes) - Task 3 TYPE
         """
+        steps = horizon_steps if horizon_steps is not None else self.default_horizon_tokens
+
         # 1. Front-end patch extraction of preictal phase window
         preictal_tokens = self.front_end(x)  # (B, N_pre, embed_dim)
 
-        # Standard causal encoder pass over ground truth preictal window
-        h_preictal = self.encode_tokens(preictal_tokens)
-        pred_next_tokens = self.pred_head(h_preictal)  # (B, N_pre, embed_dim)
+        # 2. Parallel causal encoder pass over preictal window
+        full_sequence_features = self.encode_tokens(preictal_tokens)
+        pred_next_tokens = self.pred_head(full_sequence_features)  # (B, N_pre, embed_dim)
 
-        # Task 1: Generate horizon tokens corresponding to max distance preictal->ictal
-        steps = horizon_steps if horizon_steps is not None else self.default_horizon_tokens
-        generated_horizon_tokens = self.generate_horizon(preictal_tokens, horizon_steps=steps)
-
-        # Full trajectory = preictal + generated horizon
-        full_tokens = torch.cat([preictal_tokens, generated_horizon_tokens], dim=1)
-        full_sequence_features = self.encode_tokens(full_tokens)
+        # 3. Horizon tokens: Autoregressive generation if explicitly requested, otherwise parallel slice
+        if generate_horizon_tokens:
+            generated_horizon_tokens = self.generate_horizon(preictal_tokens, horizon_steps=steps)
+        else:
+            # Parallel slice for fast training & compilation (take last 'steps' predicted tokens)
+            if pred_next_tokens.shape[1] >= steps:
+                generated_horizon_tokens = pred_next_tokens[:, -steps:, :]
+            else:
+                generated_horizon_tokens = pred_next_tokens
 
         # Task 2: Seizure Occurrence (IF) and Timing (WHEN)
         occurrence_logits, onset_preds = self.occurrence_timing_head(full_sequence_features)
@@ -375,6 +380,7 @@ class CausalEEGConformer(nn.Module):
             "onset_preds": onset_preds,
             "type_logits": type_logits,
         }
+
 
 
 # Backwards compatibility alias
