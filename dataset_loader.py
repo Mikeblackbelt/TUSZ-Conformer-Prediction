@@ -20,9 +20,10 @@ ASSUMPTIONS -- please check these and adjust constructor args if wrong:
   - `channel` follows TUSZ annotation convention: either a specific
     montage channel (e.g. "FP1-F7") or "TERM", meaning the label
     applies to the whole recording across all channels. Since windows
-    here are multichannel, rows are filtered to `channel == term_value`
-    ("TERM" by default) -- pass `term_value=None` to disable filtering
-    and keep every row regardless of channel.
+    here are multichannel, rows CAN be filtered to `channel ==
+    term_value` by passing e.g. `term_value="TERM"` -- the default is
+    `term_value=None`, which disables this filter and keeps every row
+    regardless of channel.
   - `split` is treated as the official TUSZ train/dev/eval split and
     used directly for train/val loaders, rather than a random
     patient-level split -- pass `split_map` if your split values
@@ -45,6 +46,32 @@ ASSUMPTIONS -- please check these and adjust constructor args if wrong:
   - Patient ID (for any grouping/sanity checks) is the session_key
     substring before the first underscore (TUSZ convention:
     `aaaaaaaa_s001_t000` -> patient `aaaaaaaa`).
+  - MULTI-FILE SESSIONS: a session's checkpoint array is a
+    concatenation of every .edf file in that session (see
+    Tuh-Preprocess's raw_eeg_extraction.concatenate_session_eeg), but
+    each row's start_time/stop_time are local to its own file. If a
+    `{composed_session_key}_offsets.json` file (written by
+    checkpoint_io.save_offsets) is found next to the checkpoint, each
+    row's slice is automatically shifted by that file's offset within
+    the concatenated array. Sessions without an offsets file (e.g.
+    single-file sessions, or checkpoints written before this was
+    tracked) fall back to offset 0, matching the previous behavior.
+  - `sampling_rate` MUST match the checkpoint's actual sample rate
+    (Tuh-Preprocess's raw_eeg_extraction.TARGET_SFREQ, 256 Hz as of
+    this pipeline) -- it is not a free tuning knob, since every
+    start_time/stop_time -> sample-index conversion depends on it.
+  - `exclude_labels` drops exact-match labels regardless of prefix
+    filtering (default: `("bckg",)`). True background/negative-class
+    windows should come from explicitly-derived "bg" rows (see
+    Tuh-Preprocess's preictal_segment.add_background_tags), not the
+    "bckg" tag, which is artifact-flagged and not reliable clean
+    background.
+  - `has_horizon`/`horizon_window` in the returned targets dict give
+    the REAL ground-truth EEG spanning from the end of a preictal
+    window to the actual seizure onset, for rows where that's
+    resolvable -- used to supervise the model's horizon generator
+    against reality (see train.py's horizon_loss) rather than only
+    against its own within-window continuation.
 
 Everything above is a constructor kwarg -- nothing past the defaults
 is hardcoded.
@@ -53,6 +80,7 @@ is hardcoded.
 from __future__ import annotations
 
 import bisect
+import json
 import os
 from collections import OrderedDict
 from typing import Callable, Optional, Tuple
@@ -182,6 +210,76 @@ def _find_checkpoint_file(checkpoint_dir: str, session_key: str, stage: str) -> 
     return None
 
 
+def _composed_session_key_from_base_path(base_path: str, stage: str) -> str:
+    """base_path is '.../<checkpoint_dir>/<actual_checkpoint_session_key>_<stage>'
+    (no extension) -- e.g. the checkpoint that ACTUALLY got saved for a
+    whole session (see pipeline/session_index.py in Tuh-Preprocess), which
+    is not necessarily the same string as this dataset's per-row
+    `session_key` (derived from the individual .edf file's basename -- see
+    `_default_session_key_fn`). Strips the directory and the trailing
+    "_<stage>" to recover the actual session key used for files that
+    aren't stage-specific, like the per-file sample offsets JSON."""
+    fname = os.path.basename(base_path)
+    suffix = f"_{stage}"
+    if fname.endswith(suffix):
+        fname = fname[: -len(suffix)]
+    return fname
+
+
+_OFFSETS_CACHE: dict[Tuple[str, str], Optional[list]] = {}
+
+
+def _get_session_file_offsets(checkpoint_dir: str, stage: str, session_key: str) -> Optional[list]:
+    """Loads the `{composed_session_key}_offsets.json` file (written by
+    Tuh-Preprocess's `checkpoint_io.save_offsets()`) for the session a row
+    belongs to, if one exists. A session's raw/proc checkpoint array is a
+    CONCATENATION of every .edf file in that session -- when a session has
+    more than one file (t000, t001, ... -- common in TUSZ), each file's
+    annotation start_time/stop_time are local to that individual file, not
+    the concatenated array, so they must be shifted by that file's sample
+    offset within the array before slicing. Returns None (rather than an
+    empty list) when no offsets file is found, e.g. single-file sessions or
+    checkpoints written before this was tracked -- callers should treat
+    that as "no correction available/needed", not an error.
+    """
+    base_path = _find_checkpoint_file(checkpoint_dir, session_key, stage)
+    if base_path is None:
+        return None
+    composed_key = _composed_session_key_from_base_path(base_path, stage)
+    cache_key = (checkpoint_dir, composed_key)
+    if cache_key not in _OFFSETS_CACHE:
+        offsets_path = os.path.join(checkpoint_dir, f"{composed_key}_offsets.json")
+        entries = None
+        if os.path.exists(offsets_path):
+            try:
+                with open(offsets_path) as f:
+                    entries = json.load(f)
+            except Exception:
+                entries = None
+        _OFFSETS_CACHE[cache_key] = entries
+    return _OFFSETS_CACHE[cache_key]
+
+
+def _match_offset_entry(entries: list, edf_path: str) -> Optional[dict]:
+    """Finds this row's file within a session's offset-entry list. Matched
+    by normalized path first, falling back to basename, since the offsets
+    JSON was written from whatever OS/path-separator convention the
+    preprocessing run used, which may differ from the CSV's."""
+    if not entries:
+        return None
+    target_norm = os.path.normpath(str(edf_path).replace("\\", "/"))
+    target_base = os.path.basename(target_norm)
+    for e in entries:
+        e_norm = os.path.normpath(str(e.get("edf_path", "")).replace("\\", "/"))
+        if e_norm == target_norm:
+            return e
+    for e in entries:
+        e_norm = os.path.normpath(str(e.get("edf_path", "")).replace("\\", "/"))
+        if os.path.basename(e_norm) == target_base:
+            return e
+    return None
+
+
 class SessionCache:
     """Small LRU cache so consecutive windows from the same session don't
     re-read the checkpoint off disk every time. Rows in the master CSV
@@ -259,7 +357,8 @@ def _print_dataset_summary(
     initial       = counts.get("initial", 0)
     after_channel = counts.get("after_channel", initial)
     after_status  = counts.get("after_status", after_channel)
-    after_ictal   = counts.get("after_ictal_filter", after_status)
+    after_exlabels = counts.get("after_exclude_labels", after_status)
+    after_ictal   = counts.get("after_ictal_filter", after_exlabels)
     after_prefix  = counts.get("after_label_prefix", after_ictal)
     after_conf    = counts.get("after_confidence", after_prefix)
     after_ckpt    = counts.get("after_checkpoints", after_conf)
@@ -294,6 +393,7 @@ def _print_dataset_summary(
             ("Initial CSV rows",                 initial),
             ("After channel filter",              after_channel),
             ("After status filter",               after_status),
+            ("After exact-label exclusion",       after_exlabels),
             ("After ictal-validity filter",       after_ictal),
             ("After label-prefix filter",         after_prefix),
             ("After confidence filter",           after_conf),
@@ -351,6 +451,7 @@ def _print_dataset_summary(
             ("Initial CSV rows",                 initial),
             ("After channel filter",              after_channel),
             ("After status filter",               after_status),
+            ("After exact-label exclusion",       after_exlabels),
             ("After ictal-validity filter",       after_ictal),
             ("After label-prefix filter",         after_prefix),
             ("After confidence filter",           after_conf),
@@ -441,8 +542,19 @@ class EEGWindowDataset(Dataset):
         master_csv: str,
         checkpoint_dir: str,
         stage: str = "raw",
-        sampling_rate: float = 250.0,
+        # NOTE: must match Tuh-Preprocess's raw_eeg_extraction.TARGET_SFREQ
+        # (256 Hz as of this pipeline) -- checkpoints are resampled to that
+        # rate regardless of the source .edf's native rate, so this is NOT
+        # a per-dataset tuning knob, it's a fixed fact about the checkpoint
+        # files. If your pipeline's TARGET_SFREQ ever changes, override
+        # this explicitly (e.g. via --sampling-rate in train.py) rather
+        # than relying on this default.
+        sampling_rate: float = 256.0,
         window_samples: int = 1000,
+        # Fixed-length window used for the ground-truth "horizon" signal
+        # (see `has_horizon`/`horizon_window` below) -- defaults to
+        # `window_samples` if not given.
+        horizon_window_samples: Optional[int] = None,
         label_map: Optional[dict] = None,
         edf_path_col: str = "edf_path",
         split_col: str = "split",
@@ -453,8 +565,25 @@ class EEGWindowDataset(Dataset):
         confidence_col: str = "confidence",
         status_col: str = "status",
         term_value: Optional[str] = None,
-        exclude_status: Optional[set] = {2},
+        # status 0 = collapsed/invalid window (start_cutoff pushed the
+        # window before recording start, or insufficient baseline -- see
+        # Tuh-Preprocess's preictal_segment.py docstrings), NOT
+        # "interictal data". status 2 = collapsed consecutive/postictal
+        # window. Both are degenerate (near-zero-length, mostly
+        # zero-padded after slicing) and should be excluded by default --
+        # pass an empty set to keep them if you specifically want to
+        # inspect/debug them.
+        exclude_status: Optional[set] = {0, 2},
         exclude_prefix: Tuple[str, ...] = ("x", "q", "c"),
+        # Exact-label exclusions (distinct from exclude_prefix, which
+        # matches by prefix). Default excludes "bckg": per project
+        # findings this tag is artifact-flagged, not reliable clean
+        # background, so it must not be used as the negative/background
+        # class. True background should come from explicitly-derived "bg"
+        # rows (see Tuh-Preprocess's preictal_segment.add_background_tags),
+        # which are generated from stretches of the recording with NO
+        # reliable label at all, not from the "bckg" tag.
+        exclude_labels: Tuple[str, ...] = ("bckg",),
         exclude_ictal_without_preictal: bool = True,
         min_confidence: Optional[float] = None,
         binary_preictal: bool = False,
@@ -493,6 +622,12 @@ class EEGWindowDataset(Dataset):
         if exclude_status and status_col in self.df.columns:
             self.df = self.df[~self.df[status_col].isin(exclude_status)].reset_index(drop=True)
         counts["after_status"] = len(self.df)
+
+        # 2b. Exact-label exclusions (e.g. "bckg" -- artifact-flagged, not
+        #     reliable background; see exclude_labels docstring above).
+        if exclude_labels and label_col in self.df.columns:
+            self.df = self.df[~self.df[label_col].astype(str).isin(exclude_labels)].reset_index(drop=True)
+        counts["after_exclude_labels"] = len(self.df)
 
         # 3. Ictal-validity filter: drop ictals not preceded by p* (preictal).
         #    MUST run before exclude_prefix removes c*/q* rows so that the
@@ -546,6 +681,8 @@ class EEGWindowDataset(Dataset):
         self.stage = stage
         self.sampling_rate = sampling_rate
         self.window_samples = window_samples
+        self.horizon_window_samples = horizon_window_samples if horizon_window_samples is not None else window_samples
+        self.edf_path_col = edf_path_col
         self.split_col = split_col
         self.start_col = start_col
         self.stop_col = stop_col
@@ -574,6 +711,7 @@ class EEGWindowDataset(Dataset):
         self.timing_norm = timing_norm
         self._cache = SessionCache(checkpoint_dir, stage, capacity=cache_capacity)
         self.n_resized = 0  # counts windows that needed crop/pad, for sanity checks
+        self._warned_missing_offset: set = set()
 
         # Per-session sorted list of ictal (seizure) onset times, from the final
         # filtered rows. Used in __getitem__ to compute the real "WHEN" target for
@@ -684,28 +822,70 @@ class EEGWindowDataset(Dataset):
             pw = pw.to(device)
         return pw
 
-    def _slice_window(self, arr: np.ndarray, start_time: float, stop_time: float) -> np.ndarray:
-        start_idx = int(round(start_time * self.sampling_rate))
-        stop_idx = int(round(stop_time * self.sampling_rate))
+    def _slice_window(
+        self,
+        arr: np.ndarray,
+        start_time: float,
+        stop_time: float,
+        offset_samples: int = 0,
+        target_samples: Optional[int] = None,
+    ) -> np.ndarray:
+        target_samples = target_samples if target_samples is not None else self.window_samples
+
+        start_idx = int(round(start_time * self.sampling_rate)) + offset_samples
+        stop_idx = int(round(stop_time * self.sampling_rate)) + offset_samples
         stop_idx = max(stop_idx, start_idx + 1)
+
+        # Defensive clamp to the array's actual bounds -- guards against a
+        # bad/stale offset or an annotation that runs past the end of a
+        # (possibly truncated) checkpoint array, rather than raising or
+        # silently reading garbage via negative-index wraparound.
+        n_total = arr.shape[1]
+        start_idx = max(0, min(start_idx, n_total))
+        stop_idx = max(start_idx, min(stop_idx, n_total))
 
         window = arr[:, start_idx:stop_idx]
         n = window.shape[1]
 
-        if n == self.window_samples:
+        if n == target_samples:
             return window
 
         self.n_resized += 1
-        if n > self.window_samples:
+        if n > target_samples:
             # center-crop
-            offset = (n - self.window_samples) // 2
-            return window[:, offset: offset + self.window_samples]
+            offset = (n - target_samples) // 2
+            return window[:, offset: offset + target_samples]
 
         # zero-pad (centered)
-        pad_total = self.window_samples - n
+        pad_total = target_samples - n
         pad_left = pad_total // 2
         pad_right = pad_total - pad_left
         return np.pad(window, ((0, 0), (pad_left, pad_right)), mode="constant")
+
+    def _get_offset_samples(self, session_key: str, edf_path: str) -> int:
+        """Sample offset (in this dataset's `sampling_rate` units, which
+        must match the checkpoint's actual rate -- see the constructor's
+        `sampling_rate` docstring) to add to a row's start_time/stop_time
+        before indexing into the session's checkpoint array. See
+        `_get_session_file_offsets` for why this is needed: a session's
+        checkpoint is a concatenation of potentially several .edf files,
+        but each row's start_time/stop_time are local to its own file.
+        Returns 0 (no correction) if no offsets file is found for this
+        session, e.g. single-file sessions or legacy checkpoints."""
+        entries = _get_session_file_offsets(self.checkpoint_dir, self.stage, session_key)
+        if not entries:
+            return 0
+        match = _match_offset_entry(entries, edf_path)
+        if match is None:
+            if session_key not in self._warned_missing_offset:
+                self._warned_missing_offset.add(session_key)
+                print(
+                    f"Warning: session '{session_key}' has an offsets file but no entry "
+                    f"matched edf_path={edf_path!r} -- using offset 0 for this row (and any "
+                    f"others in this session that also fail to match). Check path formatting."
+                )
+            return 0
+        return int(match.get("start_sample", 0))
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
@@ -714,7 +894,8 @@ class EEGWindowDataset(Dataset):
         arr = self._cache.get(session_key)
         start_time = float(row[self.start_col])
         stop_time = float(row[self.stop_col])
-        window = self._slice_window(arr, start_time, stop_time)
+        offset_samples = self._get_offset_samples(session_key, row[self.edf_path_col])
+        window = self._slice_window(arr, start_time, stop_time, offset_samples=offset_samples)
 
         raw_label = row["_raw_label"] if "_raw_label" in row else row[self.label_col]
         label = self.label_map[row[self.label_col]] if row[self.label_col] in self.label_map else row[self.label_col]
@@ -737,11 +918,15 @@ class EEGWindowDataset(Dataset):
 
         # Timing offset (WHEN): Relative onset time (in seconds) relative to the generated data window
         # For preictal windows (p*), relative onset is the distance/duration from preictal end to seizure start
+        onset_time: Optional[float] = None
+        has_horizon = False
         if raw_str.startswith("p"):
             onsets = self._session_ictal_onsets.get(session_key, [])
             pos = bisect.bisect_left(onsets, stop_time)
             if pos < len(onsets):
-                relative_onset = max(0.0, onsets[pos] - stop_time)
+                onset_time = onsets[pos]
+                relative_onset = max(0.0, onset_time - stop_time)
+                has_horizon = onset_time > stop_time
             else:
                 # Shouldn't normally happen (the ictal-validity filter requires every
                 # kept ictal event be immediately preceded by a p* window), but fall
@@ -756,11 +941,33 @@ class EEGWindowDataset(Dataset):
         onset_offset_t = torch.tensor(relative_onset_clamped / self.timing_norm, dtype=torch.float32)
         status_t = torch.tensor(status_val, dtype=torch.long)
 
+        # Ground-truth "horizon" signal (the real EEG spanning from the end of
+        # this preictal window to the actual seizure onset). Used to
+        # supervise the model's horizon generator against the real
+        # continuation rather than only next-token prediction within the
+        # preictal window itself (see train.py's horizon_loss). Only
+        # available for preictal rows with a resolvable onset -- everything
+        # else gets a zeroed placeholder + has_horizon=0 so batches can
+        # still collate, and the loss is masked to has_horizon==1 rows.
+        if has_horizon and onset_time is not None:
+            horizon_window = self._slice_window(
+                arr, stop_time, onset_time,
+                offset_samples=offset_samples,
+                target_samples=self.horizon_window_samples,
+            )
+            horizon_window_t = torch.from_numpy(np.ascontiguousarray(horizon_window)).float()
+            has_horizon_t = torch.tensor(1.0, dtype=torch.float32)
+        else:
+            horizon_window_t = torch.zeros((window_t.shape[0], self.horizon_window_samples), dtype=torch.float32)
+            has_horizon_t = torch.tensor(0.0, dtype=torch.float32)
+
         targets = {
             "label": label_t,
             "occurrence": occurrence_t,
             "onset_offset": onset_offset_t,
             "status": status_t,
+            "horizon_window": horizon_window_t,
+            "has_horizon": has_horizon_t,
         }
 
         return window_t, targets

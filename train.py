@@ -26,6 +26,66 @@ from conformer import CausalEEGConformer
 logger = logging.getLogger(__name__)
 
 
+@torch.no_grad()
+def _true_horizon_tokens(model: CausalEEGConformer, horizon_windows: torch.Tensor) -> torch.Tensor:
+    """Token-space target for horizon_loss: runs the model's own front_end
+    over the REAL ground-truth horizon signal (the actual EEG between the
+    end of a preictal window and the true seizure onset -- see
+    dataset_loader's `horizon_window` target) so Task 1 is supervised
+    against what actually happens next, not just against its own
+    within-preictal-window continuation.
+
+    Uses front_end.eval() for this call (restoring train mode after) so
+    this target-only pass doesn't perturb BatchNorm running stats, and
+    torch.no_grad since it's a target, never something to backprop
+    through.
+    """
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    front_end = raw_model.front_end
+    was_training = front_end.training
+    front_end.eval()
+    try:
+        tokens = front_end(horizon_windows)
+    finally:
+        if was_training:
+            front_end.train()
+    return tokens
+
+
+def _compute_horizon_loss(
+    model: CausalEEGConformer,
+    outputs: dict,
+    targets: dict,
+    device: torch.device,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    """MSE between the model's autoregressively GENERATED horizon tokens and
+    the REAL horizon tokens (from dataset_loader's `horizon_window` /
+    `has_horizon` targets), masked to rows where a real horizon target is
+    actually available (preictal rows with a resolvable seizure onset).
+    Returns `fallback` (a zero tensor matching dtype/device) if the batch
+    has no such rows or no horizon target was provided by the dataloader
+    (e.g. return_dict=False)."""
+    horizon_windows = targets.get("horizon_window") if isinstance(targets, dict) else None
+    has_horizon = targets.get("has_horizon") if isinstance(targets, dict) else None
+    if horizon_windows is None or has_horizon is None:
+        return fallback
+
+    has_horizon = has_horizon.to(device, non_blocking=True)
+    mask = has_horizon.bool()
+    if not bool(mask.any()):
+        return fallback
+
+    horizon_windows = horizon_windows.to(device, non_blocking=True)
+    gen_tokens = outputs["generated_horizon_tokens"][mask]
+    true_tokens = _true_horizon_tokens(model, horizon_windows[mask])
+
+    length = min(gen_tokens.shape[1], true_tokens.shape[1])
+    if length == 0:
+        return fallback
+    return F.mse_loss(gen_tokens[:, :length, :], true_tokens[:, :length, :])
+
+
 def train_epoch(
     model: CausalEEGConformer,
     train_loader,
@@ -38,6 +98,7 @@ def train_epoch(
     occ_pos_weight: torch.Tensor = None,
     type_class_weights: torch.Tensor = None,
     timing_weight: float = 0.001,
+    horizon_loss_weight: float = 1.0,
     max_grad_norm: float = 1.0,
     use_horizon_context: bool = True,
 ):
@@ -47,6 +108,7 @@ def train_epoch(
     total_occ_loss = 0.0
     total_timing_loss = 0.0
     total_type_loss = 0.0
+    total_horizon_loss = 0.0
 
     bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
     ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
@@ -74,7 +136,15 @@ def train_epoch(
 
         # --- AMP forward pass ---
         with torch.amp.autocast("cuda", enabled=use_amp):
-            outputs = model(windows, horizon_steps=horizon_tokens, use_horizon_context=use_horizon_context)
+            # generate_horizon_tokens=True: we need the REAL autoregressive
+            # generation (not the cheap pred_next-slice approximation) so
+            # horizon_loss below actually supervises Task 1 against the
+            # true continuation signal.
+            outputs = model(
+                windows, horizon_steps=horizon_tokens,
+                generate_horizon_tokens=True,
+                use_horizon_context=use_horizon_context,
+            )
 
             pred_next = outputs["pred_next_tokens"]
             preictal_tokens = outputs["preictal_tokens"]
@@ -82,8 +152,17 @@ def train_epoch(
             onset_preds = outputs["onset_preds"]
             type_logits = outputs["type_logits"]
 
-            # Task 1: Autoregressive MSE Loss on preictal patch sequence
+            # Task 1a: within-preictal-window next-token MSE (representation
+            # pretraining -- learns short-horizon preictal dynamics).
             gen_loss = F.mse_loss(pred_next[:, :-1, :], preictal_tokens[:, 1:, :])
+
+            # Task 1b: the actual "horizon generator" objective -- MSE
+            # between generated and REAL horizon tokens, masked to rows
+            # with a resolvable ground-truth horizon (see dataset_loader's
+            # has_horizon/horizon_window targets).
+            horizon_loss = _compute_horizon_loss(
+                model, outputs, targets, device, fallback=gen_loss.new_zeros(())
+            )
 
             # Task 2 (IF): Seizure Occurrence BCE Loss
             occ_loss = bce_criterion(occ_logits, occ_targets)
@@ -95,7 +174,7 @@ def train_epoch(
             type_loss = ce_criterion(type_logits, labels)
 
             # Composite Multi-Task Loss (scaled timing loss to prevent dominating the gradients)
-            loss = gen_loss + occ_loss + timing_weight * timing_loss + type_loss
+            loss = gen_loss + horizon_loss_weight * horizon_loss + occ_loss + timing_weight * timing_loss + type_loss
 
 
             if grad_accum_steps > 1:
@@ -132,11 +211,13 @@ def train_epoch(
         total_occ_loss += occ_loss.item()
         total_timing_loss += timing_loss.item()
         total_type_loss += type_loss.item()
+        total_horizon_loss += horizon_loss.item()
 
         gnorm_val = grad_norm.item() if not torch.isnan(grad_norm) else float("nan")
         pbar.set_postfix(
             loss=f"{loss_val:.4f}",
             gen=f"{gen_loss.item():.4f}",
+            hzn=f"{horizon_loss.item():.4f}",
             occ=f"{occ_loss.item():.4f}",
             time=f"{timing_loss.item():.4f}",
             type=f"{type_loss.item():.4f}",
@@ -149,6 +230,7 @@ def train_epoch(
         total_occ_loss / num_batches,
         total_timing_loss / num_batches,
         total_type_loss / num_batches,
+        total_horizon_loss / num_batches,
     )
 
 
@@ -189,7 +271,11 @@ def validate(
             onset_targets = torch.zeros_like(occ_targets)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            outputs = model(windows, horizon_steps=horizon_tokens, use_horizon_context=use_horizon_context)
+            outputs = model(
+                windows, horizon_steps=horizon_tokens,
+                generate_horizon_tokens=True,
+                use_horizon_context=use_horizon_context,
+            )
             pred_next = outputs["pred_next_tokens"]
             preictal_tokens = outputs["preictal_tokens"]
             occ_logits = outputs["occurrence_logits"]
@@ -197,13 +283,14 @@ def validate(
             type_logits = outputs["type_logits"]
 
             gen_loss = F.mse_loss(pred_next[:, :-1, :], preictal_tokens[:, 1:, :])
+            horizon_loss = _compute_horizon_loss(
+                model, outputs, targets, device, fallback=gen_loss.new_zeros(())
+            )
             occ_loss = bce_criterion(occ_logits, occ_targets)
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
             type_loss = ce_criterion(type_logits, labels)
 
-            loss = gen_loss + occ_loss + timing_weight * timing_loss + type_loss
-
-
+            loss = gen_loss + horizon_loss + occ_loss + timing_weight * timing_loss + type_loss
 
         total_loss += loss.item()
 
@@ -344,9 +431,48 @@ def main():
         ),
     )
     parser.add_argument(
-        "--exclude-status-0",
+        "--sampling-rate",
+        type=float,
+        default=256.0,
+        help=(
+            "Checkpoint sample rate in Hz, forwarded to EEGWindowDataset for "
+            "slicing windows out of the raw arrays. MUST match Tuh-Preprocess's "
+            "raw_eeg_extraction.TARGET_SFREQ (256 Hz as of this pipeline) -- a "
+            "mismatch here silently mis-slices every window (default: 256.0)."
+        ),
+    )
+    parser.add_argument(
+        "--horizon-window-samples",
+        type=int,
+        default=None,
+        help="Fixed length (in samples) of the ground-truth horizon window used to "
+             "supervise Task 1 (default: same as --window-samples).",
+    )
+    parser.add_argument(
+        "--horizon-loss-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight for the real-horizon-supervision loss (default: 1.0). "
+             "See horizon_loss in train_epoch/validate.",
+    )
+    parser.add_argument(
+        "--exclude-labels",
+        type=str,
+        default="bckg",
+        help="Comma-separated exact labels to drop entirely from training (default: "
+             "'bckg' -- it's an artifact-flagged tag, not reliable background; true "
+             "background should come from explicitly-derived 'bg' rows, see "
+             "Tuh-Preprocess's preictal_segment.add_background_tags). Pass '' for none.",
+    )
+    parser.add_argument(
+        "--include-status-0",
         action="store_true",
-        help="Exclude status 0 generated interictal windows (default: False, keeps status 0 for more interictal data)",
+        help=(
+            "Include status-0 rows (collapsed/invalid windows -- e.g. a preictal "
+            "window whose start_cutoff pushed it before recording start, so its "
+            "start_time==stop_time==0.0 and it's mostly zero-padding after slicing). "
+            "Excluded by default since they're degenerate, not real interictal data."
+        ),
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
     args = parser.parse_args()
@@ -383,6 +509,10 @@ def main():
         start_epoch = checkpoint.get("epoch", 1) + 1
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
 
+    exclude_labels = tuple(
+        t.strip() for t in args.exclude_labels.split(",") if t.strip()
+    ) if args.exclude_labels else ()
+
     # 1. Datasets
     logger.info("Initializing DataLoaders...")
     train_loader, val_loader, dataset = build_dataloaders(
@@ -391,11 +521,14 @@ def main():
         stage=args.stage,
         batch_size=args.batch_size,
         term_value=args.term_value,
+        sampling_rate=args.sampling_rate,
         window_samples=args.window_samples,
+        horizon_window_samples=args.horizon_window_samples,
         binary_preictal=args.binary_preictal,
         cache_capacity=args.cache_capacity,
         num_workers=args.num_workers,
-        exclude_status={0, 2} if args.exclude_status_0 else {2},
+        exclude_status={2} if args.include_status_0 else {0, 2},
+        exclude_labels=exclude_labels,
         timing_norm=args.timing_norm_seconds,
     )
 
@@ -482,7 +615,7 @@ def main():
     logger.info("Starting Multi-Task Training Loop...")
     for epoch in range(start_epoch, args.epochs + 1):
         logger.info(f"--- Epoch {epoch:02d}/{args.epochs:02d} ---")
-        train_loss, gen_l, occ_l, time_l, type_l = train_epoch(
+        train_loss, gen_l, occ_l, time_l, type_l, horizon_l = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -494,6 +627,7 @@ def main():
             occ_pos_weight=occ_pos_weight,
             type_class_weights=type_class_weights,
             timing_weight=args.timing_weight,
+            horizon_loss_weight=args.horizon_loss_weight,
             max_grad_norm=args.max_grad_norm,
             use_horizon_context=horizon_gate_open,
         )
@@ -551,7 +685,7 @@ def main():
 
         logger.info(
             f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} "
-            f"(Gen: {gen_l:.4f}, Occ: {occ_l:.4f}, Timing: {time_l:.4f}, Type: {type_l:.4f}) | "
+            f"(Gen: {gen_l:.4f}, Horizon: {horizon_l:.4f}, Occ: {occ_l:.4f}, Timing: {time_l:.4f}, Type: {type_l:.4f}) | "
             f"Val Loss: {val_loss:.4f} | Val Occ Acc: {val_occ_acc * 100:.2f}% | Val Type Acc: {val_type_acc * 100:.2f}%"
         )
 
