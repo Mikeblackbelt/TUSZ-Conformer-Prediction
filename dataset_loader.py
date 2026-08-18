@@ -581,6 +581,10 @@ class EEGWindowDataset(Dataset):
         return_dict: bool = True,
         timing_norm: float = 300.0,  # seconds; onset_offset target is divided by this so its
                                       # loss scale is O(1) instead of O(hundreds of seconds)
+        # Background (bg*) rows are typically 10-50x more numerous than seizure
+        # windows. max_bg_ratio caps the bg row count to at most this multiple
+        # of the total non-bg row count. Set to None to keep all bg rows.
+        max_bg_ratio: float = 3.0,
     ):
         master_csv = _normalize_dir_path(master_csv)
         checkpoint_dir = _normalize_dir_path(checkpoint_dir)
@@ -635,6 +639,28 @@ class EEGWindowDataset(Dataset):
         if min_confidence is not None and confidence_col in self.df.columns:
             self.df = self.df[self.df[confidence_col] >= min_confidence].reset_index(drop=True)
         counts["after_confidence"] = len(self.df)
+
+        # 5b. Background subsampling: cap bg rows to max_bg_ratio * non-bg rows.
+        # Without this, bg can represent 90%+ of the dataset and the model
+        # learns to always predict bg regardless of loss weights.
+        if max_bg_ratio is not None:
+            bg_mask = self.df[label_col].astype(str).str.startswith("b")
+            n_nonbg = int((~bg_mask).sum())
+            n_bg = int(bg_mask.sum())
+            max_bg = int(n_nonbg * max_bg_ratio)
+            if n_bg > max_bg:
+                keep_bg_idx = (
+                    self.df[bg_mask]
+                    .sample(n=max_bg, random_state=42)
+                    .index
+                )
+                self.df = pd.concat([
+                    self.df[~bg_mask],
+                    self.df.loc[keep_bg_idx],
+                ]).sort_index().reset_index(drop=True)
+                print(f"Background subsampled: {n_bg} -> {max_bg} rows "
+                      f"(ratio {max_bg_ratio}x {n_nonbg} non-bg rows).")
+        counts["after_bg_subsample"] = len(self.df)
 
         # 6. Filter out sessions whose checkpoint files do not exist on disk
         if skip_missing_checkpoints:
@@ -753,8 +779,8 @@ class EEGWindowDataset(Dataset):
         """Inverse-frequency weight tensor for CrossEntropyLoss.
 
         Returns a 1-D float tensor of length ``num_classes`` where
-        ``weights[c] = total / (num_classes * count[c])``, which is the
-        standard sklearn-style balanced weight.  Missing classes get weight 1.
+        ``weights[c] = total / (num_classes * count[c])``, capped at 10.0.
+        Missing classes get weight 1.
         """
         counts = self.get_class_counts(indices)
         total = sum(counts.values())
@@ -762,8 +788,8 @@ class EEGWindowDataset(Dataset):
         weights = []
         for c in range(num_cls):
             cnt = counts.get(c, 1)  # avoid div-by-zero for unseen classes
-            raw_w = (total / (num_cls * max(1, cnt))) ** 0.5  # smooth square-root scaling
-            w = min(raw_w, 3.0)  # cap max weight to 3.0 to prevent minority-class collapse
+            raw_w = total / (num_cls * max(1, cnt))  # standard sklearn balanced weight
+            w = min(raw_w, 25.0)  # cap at 25 to prevent extreme minority-class collapse
             weights.append(w)
         t = torch.tensor(weights, dtype=torch.float32)
         if device is not None:

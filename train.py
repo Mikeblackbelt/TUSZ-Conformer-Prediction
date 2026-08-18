@@ -475,6 +475,16 @@ def main():
             "Excluded by default since they're degenerate, not real interictal data."
         ),
     )
+    parser.add_argument(
+        "--max-bg-ratio",
+        type=float,
+        default=3.0,
+        help=(
+            "Cap background (bg*) rows to at most this multiple of the non-background "
+            "row count after all other filters. Prevents the model from overfitting to "
+            "the majority background class. Set to 0 to disable subsampling (default: 3.0)."
+        ),
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
     args = parser.parse_args()
 
@@ -531,6 +541,7 @@ def main():
         exclude_status={2} if args.include_status_0 else {0, 2},
         exclude_labels=exclude_labels,
         timing_norm=args.timing_norm_seconds,
+        max_bg_ratio=args.max_bg_ratio if args.max_bg_ratio > 0 else None,
         use_session_batching=not args.no_session_batching,
     )
 
