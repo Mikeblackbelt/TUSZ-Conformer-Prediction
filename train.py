@@ -26,6 +26,73 @@ from conformer import CausalEEGConformer
 logger = logging.getLogger(__name__)
 
 
+class FocalBCEWithLogitsLoss(nn.Module):
+    """Binary focal loss (Lin et al., 2017) on top of BCEWithLogitsLoss.
+
+    Down-weights already-easy, correctly-classified examples via ``(1-p_t)**gamma``
+    so gradient signal isn't swamped by the majority class the way plain
+    ``pos_weight`` reweighting can be on severe (>4:1) imbalance -- pos_weight
+    only rescales the *loss value* for positives, it doesn't reduce the *volume*
+    of easy-majority gradient. ``pos_weight`` is still applied as an alpha term
+    so per-class balance is preserved on top of the focal down-weighting.
+    """
+
+    def __init__(self, pos_weight: torch.Tensor = None, gamma: float = 2.0):
+        super().__init__()
+        self.register_buffer("pos_weight", pos_weight if pos_weight is not None else None, persistent=False)
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p_t = torch.exp(-bce)  # p if target==1 else (1-p)
+        focal_term = (1.0 - p_t) ** self.gamma
+        loss = focal_term * bce
+        if self.pos_weight is not None:
+            alpha_t = torch.where(targets > 0.5, self.pos_weight, torch.ones_like(targets))
+            loss = alpha_t * loss
+        return loss.mean()
+
+
+class FocalCrossEntropyLoss(nn.Module):
+    """Multi-class focal loss on top of CrossEntropyLoss (keeps class `weight`
+    and `label_smoothing` support so it's a drop-in swap for the existing
+    ``nn.CrossEntropyLoss(weight=..., label_smoothing=...)`` criterion."""
+
+    def __init__(self, weight: torch.Tensor = None, gamma: float = 2.0, label_smoothing: float = 0.0):
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(
+            logits, targets, weight=self.weight, label_smoothing=self.label_smoothing, reduction="none"
+        )
+        p_t = torch.exp(-ce)
+        focal_term = (1.0 - p_t) ** self.gamma
+        return (focal_term * ce).mean()
+
+
+def _macro_prf1_from_confusion(cm: torch.Tensor) -> tuple[float, float, float]:
+    """Macro-averaged precision/recall/F1 over all classes in a confusion matrix
+    (rows=true, cols=predicted). Used for model selection instead of val_loss,
+    since val_loss can improve when a model collapses to the majority class on
+    an imbalanced dataset while minority-class recall goes to ~0."""
+    num_classes = cm.shape[0]
+    precisions, recalls, f1s = [], [], []
+    for i in range(num_classes):
+        support = cm[i, :].sum().item()
+        predicted_count = cm[:, i].sum().item()
+        tp = cm[i, i].item()
+        recall = tp / support if support > 0 else 0.0
+        precision = tp / predicted_count if predicted_count > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+    return sum(precisions) / num_classes, sum(recalls) / num_classes, sum(f1s) / num_classes
+
+
 @torch.no_grad()
 def _true_horizon_tokens(model: CausalEEGConformer, horizon_windows: torch.Tensor) -> torch.Tensor:
     """Token-space target for horizon_loss: runs the model's own front_end
@@ -101,6 +168,8 @@ def train_epoch(
     horizon_loss_weight: float = 1.0,
     max_grad_norm: float = 1.0,
     use_horizon_context: bool = True,
+    use_focal_loss: bool = False,
+    focal_gamma: float = 2.0,
 ):
     model.train()
     total_loss = 0.0
@@ -110,8 +179,12 @@ def train_epoch(
     total_type_loss = 0.0
     total_horizon_loss = 0.0
 
-    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
-    ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
+    if use_focal_loss:
+        bce_criterion = FocalBCEWithLogitsLoss(pos_weight=occ_pos_weight, gamma=focal_gamma)
+        ce_criterion = FocalCrossEntropyLoss(weight=type_class_weights, gamma=focal_gamma, label_smoothing=0.1)
+    else:
+        bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
+        ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
     num_batches = len(train_loader)
     use_amp = scaler is not None and device.type == "cuda"
 
@@ -245,14 +318,30 @@ def validate(
     type_class_weights: torch.Tensor = None,
     timing_weight: float = 0.001,
     use_horizon_context: bool = True,
+    use_focal_loss: bool = False,
+    focal_gamma: float = 2.0,
+    num_classes: Optional[int] = None,
 ):
     model.eval()
     total_loss = 0.0
     correct_type = 0
     correct_occ = 0
     total_samples = 0
-    ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
-    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
+
+    # Confusion matrix over Task 3 (type) predictions, accumulated alongside the
+    # loss pass so macro-F1 is available every epoch (not just at the end of
+    # training) -- this is what checkpoint selection should key off of instead
+    # of val_loss, since val_loss can drop when the model collapses to the
+    # majority class on an imbalanced dataset. Falls back to a binary (2-class)
+    # matrix if num_classes isn't provided.
+    cm = torch.zeros(num_classes or 2, num_classes or 2, dtype=torch.long)
+
+    if use_focal_loss:
+        ce_criterion = FocalCrossEntropyLoss(weight=type_class_weights, gamma=focal_gamma, label_smoothing=0.1)
+        bce_criterion = FocalBCEWithLogitsLoss(pos_weight=occ_pos_weight, gamma=focal_gamma)
+    else:
+        ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
+        bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
 
     for batch in tqdm(val_loader, desc="Validating"):
         if isinstance(batch, (list, tuple)):
@@ -302,10 +391,15 @@ def validate(
         correct_occ += (occ_preds == occ_targets).sum().item()
         total_samples += labels.size(0)
 
+        for t, p in zip(labels.view(-1).tolist(), type_preds.view(-1).tolist()):
+            if t < cm.shape[0] and p < cm.shape[1]:
+                cm[t, p] += 1
+
     num_batches = len(val_loader)
     type_acc = correct_type / total_samples if total_samples > 0 else 0.0
     occ_acc = correct_occ / total_samples if total_samples > 0 else 0.0
-    return total_loss / num_batches, type_acc, occ_acc
+    macro_precision, macro_recall, macro_f1 = _macro_prf1_from_confusion(cm)
+    return total_loss / num_batches, type_acc, occ_acc, macro_f1, macro_precision, macro_recall
 
 
 @torch.no_grad()
@@ -625,6 +719,13 @@ def main():
     # drops below the threshold.
     horizon_gate_open = False
 
+    # best.pt now tracks best MACRO-F1, not best val_loss. On imbalanced data,
+    # val_loss can improve when the model collapses to predicting the majority
+    # class (recall on minority classes -> ~0) -- that used to get saved as
+    # "best". Macro-F1 penalizes that collapse directly since it averages
+    # per-class F1 unweighted by support.
+    best_macro_f1 = -1.0
+
     logger.info("Starting Multi-Task Training Loop...")
     for epoch in range(start_epoch, args.epochs + 1):
         logger.info(f"--- Epoch {epoch:02d}/{args.epochs:02d} ---")
@@ -643,6 +744,8 @@ def main():
             horizon_loss_weight=args.horizon_loss_weight,
             max_grad_norm=args.max_grad_norm,
             use_horizon_context=horizon_gate_open,
+            use_focal_loss=args.use_focal_loss,
+            focal_gamma=args.focal_gamma,
         )
 
         if not horizon_gate_open and gen_l < args.horizon_gate_threshold:
@@ -652,7 +755,7 @@ def main():
                 f"{args.horizon_gate_threshold}) — Tasks 2/3 will see horizon context from next epoch on."
             )
 
-        val_loss, val_type_acc, val_occ_acc = validate(
+        val_loss, val_type_acc, val_occ_acc, val_macro_f1, val_macro_precision, val_macro_recall = validate(
             model,
             val_loader,
             device,
@@ -662,6 +765,9 @@ def main():
             type_class_weights=type_class_weights,
             timing_weight=args.timing_weight,
             use_horizon_context=horizon_gate_open,
+            use_focal_loss=args.use_focal_loss,
+            focal_gamma=args.focal_gamma,
+            num_classes=num_classes,
         )
 
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -676,13 +782,18 @@ def main():
                 "val_loss": val_loss,
                 "val_type_acc": val_type_acc,
                 "val_occ_acc": val_occ_acc,
+                "val_macro_f1": val_macro_f1,
+                "val_macro_precision": val_macro_precision,
+                "val_macro_recall": val_macro_recall,
                 "best_val_loss": min(best_val_loss, val_loss),
+                "best_macro_f1": max(best_macro_f1, val_macro_f1),
             },
             ckpt_save_path,
         )
+        best_val_loss = min(best_val_loss, val_loss)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_macro_f1 > best_macro_f1:
+            best_macro_f1 = val_macro_f1
             torch.save(
                 {
                     "epoch": epoch,
@@ -691,15 +802,21 @@ def main():
                     "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
+                    "val_macro_f1": val_macro_f1,
+                    "val_macro_precision": val_macro_precision,
+                    "val_macro_recall": val_macro_recall,
                     "best_val_loss": best_val_loss,
+                    "best_macro_f1": best_macro_f1,
                 },
                 os.path.join(args.output_dir, "best.pt"),
             )
+            logger.info(f"New best macro-F1: {best_macro_f1:.4f} — saved best.pt")
 
         logger.info(
             f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} "
             f"(Gen: {gen_l:.4f}, Horizon: {horizon_l:.4f}, Occ: {occ_l:.4f}, Timing: {time_l:.4f}, Type: {type_l:.4f}) | "
-            f"Val Loss: {val_loss:.4f} | Val Occ Acc: {val_occ_acc * 100:.2f}% | Val Type Acc: {val_type_acc * 100:.2f}%"
+            f"Val Loss: {val_loss:.4f} | Val Occ Acc: {val_occ_acc * 100:.2f}% | Val Type Acc: {val_type_acc * 100:.2f}% | "
+            f"Val Macro-F1: {val_macro_f1:.4f} (P: {val_macro_precision:.4f} / R: {val_macro_recall:.4f})"
         )
 
     logger.info("Training complete. Computing final confusion matrix on validation set...")
