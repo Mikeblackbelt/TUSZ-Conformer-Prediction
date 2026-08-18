@@ -385,7 +385,8 @@ def main():
     parser.add_argument("--embed-dim", type=int, default=128, help="Token embedding dimension (default: 128)")
     parser.add_argument("--horizon-tokens", type=int, default=10, help="Number of horizon tokens to generate (default: 10)")
     parser.add_argument("--binary-preictal", action="store_true", help="Map labels into binary classification")
-    parser.add_argument("--cache-capacity", type=int, default=4, help="LRU cache capacity")
+    parser.add_argument("--cache-capacity", type=int, default=128, help="LRU cache capacity (default: 128)")
+    parser.add_argument("--no-session-batching", action="store_true", help="Disable SessionBatchSampler")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes")
     parser.add_argument("--output-dir", default="checkpoints", help="Directory to save training checkpoints")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
@@ -530,6 +531,7 @@ def main():
         exclude_status={2} if args.include_status_0 else {0, 2},
         exclude_labels=exclude_labels,
         timing_norm=args.timing_norm_seconds,
+        use_session_batching=not args.no_session_batching,
     )
 
     num_classes = dataset.num_classes
