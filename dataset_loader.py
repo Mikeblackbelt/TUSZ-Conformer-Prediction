@@ -899,7 +899,7 @@ class EEGWindowDataset(Dataset):
 
         raw_label = row["_raw_label"] if "_raw_label" in row else row[self.label_col]
         label = self.label_map[row[self.label_col]] if row[self.label_col] in self.label_map else row[self.label_col]
-        status_val = int(row[self.status_col]) if self.status_col in row else 1
+        status_val = int(row[self.status_col]) if (self.status_col in row and pd.notna(row[self.status_col])) else 1
 
         window_t = torch.from_numpy(np.ascontiguousarray(window)).float()
         label_t = torch.tensor(label, dtype=torch.long)
