@@ -580,6 +580,17 @@ def main():
         ),
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
+    parser.add_argument(
+        "--use-focal-loss",
+        action="store_true",
+        help="Use Focal Loss (FocalBCE and FocalCrossEntropy) instead of standard BCE/CE loss.",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=2.0,
+        help="Focal Loss focusing parameter gamma (default: 2.0).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
