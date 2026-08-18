@@ -94,7 +94,7 @@ def _macro_prf1_from_confusion(cm: torch.Tensor) -> tuple[float, float, float]:
 
 
 @torch.no_grad()
-def _true_horizon_tokens(model: CausalEEGConformer, horizon_windows: torch.Tensor) -> torch.Tensor:
+def _true_horizon_tokens(model: nn.Module, horizon_windows: torch.Tensor) -> torch.Tensor:
     """Token-space target for horizon_loss: runs the model's own front_end
     over the REAL ground-truth horizon signal (the actual EEG between the
     end of a preictal window and the true seizure onset -- see
@@ -154,7 +154,7 @@ def _compute_horizon_loss(
 
 
 def train_epoch(
-    model: CausalEEGConformer,
+    model: nn.Module,
     train_loader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -223,7 +223,7 @@ def train_epoch(
             preictal_tokens = outputs["preictal_tokens"]
             occ_logits = outputs["occurrence_logits"]
             onset_preds = outputs["onset_preds"]
-            type_logits = outputs["type_logits"]
+            type_logits = outputs["preictal_type_logits"] if "preictal_type_logits" in outputs else outputs["type_logits"]
 
             # Task 1a: within-preictal-window next-token MSE (representation
             # pretraining -- learns short-horizon preictal dynamics).
@@ -243,11 +243,17 @@ def train_epoch(
             # Task 2 (WHEN): Seizure Onset Timing Smooth L1 (Huber) Loss (relative seconds)
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
 
-            # Task 3 (TYPE): Seizure Type CrossEntropy Loss
+            # Task 3 / Head 4: Seizure Type CrossEntropy Loss
             type_loss = ce_criterion(type_logits, labels)
 
+            # Head 3 (Preictal Binary Classification if present)
+            preictal_loss = gen_loss.new_zeros(())
+            if "preictal_logits" in outputs:
+                preictal_targets = (labels > 0).float().unsqueeze(-1)
+                preictal_loss = bce_criterion(outputs["preictal_logits"], preictal_targets)
+
             # Composite Multi-Task Loss (scaled timing loss to prevent dominating the gradients)
-            loss = gen_loss + horizon_loss_weight * horizon_loss + occ_loss + timing_weight * timing_loss + type_loss
+            loss = gen_loss + horizon_loss_weight * horizon_loss + occ_loss + timing_weight * timing_loss + type_loss + preictal_loss
 
 
             if grad_accum_steps > 1:
@@ -309,7 +315,7 @@ def train_epoch(
 
 @torch.no_grad()
 def validate(
-    model: CausalEEGConformer,
+    model: nn.Module,
     val_loader,
     device: torch.device,
     use_amp=False,
@@ -369,7 +375,7 @@ def validate(
             preictal_tokens = outputs["preictal_tokens"]
             occ_logits = outputs["occurrence_logits"]
             onset_preds = outputs["onset_preds"]
-            type_logits = outputs["type_logits"]
+            type_logits = outputs["preictal_type_logits"] if "preictal_type_logits" in outputs else outputs["type_logits"]
 
             gen_loss = F.mse_loss(pred_next[:, :-1, :], preictal_tokens[:, 1:, :])
             horizon_loss = _compute_horizon_loss(
@@ -379,7 +385,12 @@ def validate(
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
             type_loss = ce_criterion(type_logits, labels)
 
-            loss = gen_loss + horizon_loss + occ_loss + timing_weight * timing_loss + type_loss
+            preictal_loss = gen_loss.new_zeros(())
+            if "preictal_logits" in outputs:
+                preictal_targets = (labels > 0).float().unsqueeze(-1)
+                preictal_loss = bce_criterion(outputs["preictal_logits"], preictal_targets)
+
+            loss = gen_loss + horizon_loss + occ_loss + timing_weight * timing_loss + type_loss + preictal_loss
 
         total_loss += loss.item()
 
@@ -404,7 +415,7 @@ def validate(
 
 @torch.no_grad()
 def compute_confusion_matrix(
-    model: CausalEEGConformer,
+    model: nn.Module,
     val_loader,
     device: torch.device,
     num_classes: int,
@@ -468,6 +479,13 @@ def log_confusion_matrix(cm: torch.Tensor, label_names: Optional[list] = None) -
 
 def main():
     parser = argparse.ArgumentParser(description="Train 3-Head Causal EEG-Conformer Model.")
+    parser.add_argument(
+        "--model-arch",
+        type=str,
+        default="causal_conformer",
+        choices=["causal_conformer", "simplified_eeg_conformer", "simplified_conformer"],
+        help="Model architecture: 'causal_conformer' (default) or 'simplified_eeg_conformer'",
+    )
     parser.add_argument("--master-csv", required=True, help="Path to master CSV from build_master_file()")
     parser.add_argument("--checkpoint-dir", required=True, help="Directory containing session checkpoints")
     parser.add_argument("--stage", default="proc", choices=["raw", "proc"], help="Checkpoint stage ('raw' or 'proc')")
@@ -657,12 +675,23 @@ def main():
     logger.info(f"Dataset loaded: {len(dataset)} samples | {num_classes} classes | shape: ({n_channels}, {n_samples})")
 
     # 2. Build Model
-    model = CausalEEGConformer(
-        n_channels=n_channels,
-        embed_dim=args.embed_dim,
-        num_classes=num_classes,
-        default_horizon_tokens=args.horizon_tokens,
-    ).to(device)
+    if args.model_arch in ("simplified_eeg_conformer", "simplified_conformer"):
+        from simplified_conformer import SimplifiedEEGConformer
+        model = SimplifiedEEGConformer(
+            n_channels=n_channels,
+            embed_dim=args.embed_dim,
+            num_classes=num_classes,
+            default_horizon_tokens=args.horizon_tokens,
+        ).to(device)
+        logger.info("Instantiated SimplifiedEEGConformer model architecture")
+    else:
+        model = CausalEEGConformer(
+            n_channels=n_channels,
+            embed_dim=args.embed_dim,
+            num_classes=num_classes,
+            default_horizon_tokens=args.horizon_tokens,
+        ).to(device)
+        logger.info("Instantiated CausalEEGConformer model architecture")
 
     if loaded_state_dict is not None:
         model.load_state_dict(loaded_state_dict)
