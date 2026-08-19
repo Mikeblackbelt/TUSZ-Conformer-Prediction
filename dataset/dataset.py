@@ -199,6 +199,7 @@ class EEGWindowDataset(Dataset):
         self.timing_norm = timing_norm
         self._cache = SessionCache(checkpoint_dir, stage, capacity=cache_capacity)
         self.n_resized = 0
+        self._n_channels: Optional[int] = None
         self._warned_missing_offset: set = set()
 
         self._session_ictal_onsets: dict = {}
@@ -351,7 +352,8 @@ class EEGWindowDataset(Dataset):
                 "Skipping corrupted/missing checkpoint for session '%s' (row %d)",
                 session_key, idx,
             )
-            window_t = torch.zeros((1, self.window_samples), dtype=torch.float32)
+            nc = self._n_channels if self._n_channels is not None else 1
+            window_t = torch.zeros((nc, self.window_samples), dtype=torch.float32)
             label_t = torch.tensor(0, dtype=torch.long)
             if not self.return_dict:
                 return window_t, label_t
@@ -360,9 +362,14 @@ class EEGWindowDataset(Dataset):
                 "occurrence": torch.tensor(0.0, dtype=torch.float32),
                 "onset_offset": torch.tensor(0.0, dtype=torch.float32),
                 "status": torch.tensor(1, dtype=torch.long),
-                "horizon_window": torch.zeros((1, self.horizon_window_samples), dtype=torch.float32),
+                "horizon_window": torch.zeros((nc, self.horizon_window_samples), dtype=torch.float32),
                 "has_horizon": torch.tensor(0.0, dtype=torch.float32),
             }
+
+        # Cache the channel count from the first successful load so fallback
+        # paths can produce tensors with a matching shape.
+        if self._n_channels is None:
+            self._n_channels = arr.shape[0]
 
         start_time = float(row[self.start_col])
         stop_time = float(row[self.stop_col])
