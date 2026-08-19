@@ -341,7 +341,29 @@ class EEGWindowDataset(Dataset):
         row = self.df.iloc[idx]
         session_key = row["session_key"]
 
-        arr = self._cache.get(session_key)
+        try:
+            arr = self._cache.get(session_key)
+        except FileNotFoundError:
+            # Corrupted or missing checkpoint — return a zero-filled sample
+            # so the DataLoader worker doesn't crash mid-epoch.
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "Skipping corrupted/missing checkpoint for session '%s' (row %d)",
+                session_key, idx,
+            )
+            window_t = torch.zeros((1, self.window_samples), dtype=torch.float32)
+            label_t = torch.tensor(0, dtype=torch.long)
+            if not self.return_dict:
+                return window_t, label_t
+            return window_t, {
+                "label": label_t,
+                "occurrence": torch.tensor(0.0, dtype=torch.float32),
+                "onset_offset": torch.tensor(0.0, dtype=torch.float32),
+                "status": torch.tensor(1, dtype=torch.long),
+                "horizon_window": torch.zeros((1, self.horizon_window_samples), dtype=torch.float32),
+                "has_horizon": torch.tensor(0.0, dtype=torch.float32),
+            }
+
         start_time = float(row[self.start_col])
         stop_time = float(row[self.stop_col])
         offset_samples = self._get_offset_samples(session_key, row[self.edf_path_col])

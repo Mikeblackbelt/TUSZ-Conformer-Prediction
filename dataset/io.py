@@ -5,7 +5,9 @@ Checkpoint array loading, directory indexing, session key parsing, and SessionCa
 from __future__ import annotations
 
 import json
+import logging
 import os
+import zipfile
 from collections import OrderedDict
 from typing import Optional, Tuple
 
@@ -39,18 +41,25 @@ def _load_parquet_array(path: str) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
-def _load_npz_or_npy_array(path: str) -> np.ndarray:
-    if path.endswith(".npz"):
-        with np.load(path) as data:
-            if "eeg" in data:
-                arr = data["eeg"]
-            elif "data" in data:
-                arr = data["data"]
-            else:
-                first_key = list(data.keys())[0]
-                arr = data[first_key]
-    else:
-        arr = np.load(path)
+logger = logging.getLogger(__name__)
+
+
+def _load_npz_or_npy_array(path: str) -> Optional[np.ndarray]:
+    try:
+        if path.endswith(".npz"):
+            with np.load(path) as data:
+                if "eeg" in data:
+                    arr = data["eeg"]
+                elif "data" in data:
+                    arr = data["data"]
+                else:
+                    first_key = list(data.keys())[0]
+                    arr = data[first_key]
+        else:
+            arr = np.load(path)
+    except (zipfile.BadZipFile, OSError) as exc:
+        logger.warning("Corrupted checkpoint file %s: %s — skipping session", path, exc)
+        return None
 
     if arr.dtype == np.float64:
         arr = arr.astype(np.float32)
