@@ -243,8 +243,12 @@ def train_epoch(
             # Task 2 (WHEN): Seizure Onset Timing Smooth L1 (Huber) Loss (relative seconds)
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
 
-            # Task 3 / Head 4: Seizure Type CrossEntropy Loss
-            type_loss = ce_criterion(type_logits, labels)
+            # Task 3 / Head 4: Seizure Type CrossEntropy Loss (restricted to positive / non-background rows)
+            pos_mask = (occ_targets.squeeze(-1) > 0)
+            if pos_mask.any():
+                type_loss = ce_criterion(type_logits[pos_mask], labels[pos_mask])
+            else:
+                type_loss = type_logits.sum() * 0.0
 
             # Head 3 (Preictal Binary Classification if present)
             preictal_loss = gen_loss.new_zeros(())
@@ -333,6 +337,7 @@ def validate(
     correct_type = 0
     correct_occ = 0
     total_samples = 0
+    total_pos_samples = 0
 
     # Confusion matrix over Task 3 (type) predictions, accumulated alongside the
     # loss pass so macro-F1 is available every epoch (not just at the end of
@@ -365,6 +370,8 @@ def validate(
             occ_targets = (labels > 0).float().unsqueeze(-1)
             onset_targets = torch.zeros_like(occ_targets)
 
+        pos_mask = (occ_targets.squeeze(-1) > 0)
+
         with torch.amp.autocast("cuda", enabled=use_amp):
             outputs = model(
                 windows, horizon_steps=horizon_tokens,
@@ -383,7 +390,11 @@ def validate(
             )
             occ_loss = bce_criterion(occ_logits, occ_targets)
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
-            type_loss = ce_criterion(type_logits, labels)
+
+            if pos_mask.any():
+                type_loss = ce_criterion(type_logits[pos_mask], labels[pos_mask])
+            else:
+                type_loss = type_logits.sum() * 0.0
 
             preictal_loss = gen_loss.new_zeros(())
             if "preictal_logits" in outputs:
@@ -398,16 +409,18 @@ def validate(
         type_preds = type_logits.argmax(dim=-1)
         occ_preds = (torch.sigmoid(occ_logits) >= 0.5).float()
 
-        correct_type += (type_preds == labels).sum().item()
+        if pos_mask.any():
+            correct_type += (type_preds[pos_mask] == labels[pos_mask]).sum().item()
+            total_pos_samples += pos_mask.sum().item()
+            for t, p in zip(labels[pos_mask].view(-1).tolist(), type_preds[pos_mask].view(-1).tolist()):
+                if t < cm.shape[0] and p < cm.shape[1]:
+                    cm[t, p] += 1
+
         correct_occ += (occ_preds == occ_targets).sum().item()
         total_samples += labels.size(0)
 
-        for t, p in zip(labels.view(-1).tolist(), type_preds.view(-1).tolist()):
-            if t < cm.shape[0] and p < cm.shape[1]:
-                cm[t, p] += 1
-
     num_batches = len(val_loader)
-    type_acc = correct_type / total_samples if total_samples > 0 else 0.0
+    type_acc = correct_type / total_pos_samples if total_pos_samples > 0 else 0.0
     occ_acc = correct_occ / total_samples if total_samples > 0 else 0.0
     macro_precision, macro_recall, macro_f1 = _macro_prf1_from_confusion(cm)
     return total_loss / num_batches, type_acc, occ_acc, macro_f1, macro_precision, macro_recall
@@ -435,8 +448,14 @@ def compute_confusion_matrix(
             windows, targets = batch, {}
 
         windows = windows.to(device, non_blocking=True)
-        labels = targets["label"] if isinstance(targets, dict) else targets
-        labels = labels.to(device, non_blocking=True)
+        if isinstance(targets, dict):
+            labels = targets["label"].to(device, non_blocking=True)
+            occ_targets = targets["occurrence"].to(device, non_blocking=True).unsqueeze(-1)
+        else:
+            labels = targets.to(device, non_blocking=True)
+            occ_targets = (labels > 0).float().unsqueeze(-1)
+
+        pos_mask = (occ_targets.squeeze(-1) > 0)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             outputs = model(
@@ -446,8 +465,10 @@ def compute_confusion_matrix(
             )
             type_preds = outputs["type_logits"].argmax(dim=-1)
 
-        for t, p in zip(labels.view(-1).tolist(), type_preds.view(-1).tolist()):
-            cm[t, p] += 1
+        if pos_mask.any():
+            for t, p in zip(labels[pos_mask].view(-1).tolist(), type_preds[pos_mask].view(-1).tolist()):
+                if t < cm.shape[0] and p < cm.shape[1]:
+                    cm[t, p] += 1
 
     return cm
 

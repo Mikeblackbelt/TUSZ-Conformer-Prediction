@@ -466,17 +466,80 @@ def _print_dataset_summary(
         print("═" * W + "\n")
 
 
+# Label category constants
+LABEL_CATEGORY_BACKGROUND = "background"
+LABEL_CATEGORY_PREICTAL = "preictal"
+LABEL_CATEGORY_ICTAL = "ictal"
+LABEL_CATEGORY_EXCLUDED = "excluded"
+
+ALLOWED_LABEL_CATEGORIES = {
+    LABEL_CATEGORY_BACKGROUND,
+    LABEL_CATEGORY_PREICTAL,
+    LABEL_CATEGORY_ICTAL,
+    LABEL_CATEGORY_EXCLUDED,
+}
+
+# Known base seizure types from TUH EEG dataset / preictal preprocessing engine
+KNOWN_SEIZURE_TYPES = {
+    "fnsz", "gnsz", "cpsz", "spsz", "tnsz", "tcsz", "absz", "mysz", "seiz", "nesz"
+}
+
+# Background raw labels emitted by preprocessing or raw CSVs
+BACKGROUND_LABELS = {
+    "bg", "bckg", "background", "0", "0.0", "-1", "none", "nan", "null", ""
+}
+
+# Artifact / exclusion tags
+EXCLUSION_TAGS = {
+    "artf", "eyem", "chew", "cero", "eloh", "elec", "gspd", "pled"
+}
+
+
+def classify_label(raw_val: Any) -> str:
+    """Classify raw annotation label into one of four explicit categories:
+    {'background', 'preictal', 'ictal', 'excluded'}.
+
+    Raises ValueError if raw_val is unrecognized (fail-loud).
+    """
+    if raw_val is None or (isinstance(raw_val, float) and np.isnan(raw_val)):
+        return LABEL_CATEGORY_BACKGROUND
+
+    s = str(raw_val).strip().lower()
+
+    # 1. Exact background match
+    if s in BACKGROUND_LABELS or s.startswith("0"):
+        return LABEL_CATEGORY_BACKGROUND
+
+    # 2. Exact ictal match
+    if s in KNOWN_SEIZURE_TYPES:
+        return LABEL_CATEGORY_ICTAL
+
+    # 3. Preictal variants: starts with 'p' followed by known seizure type or is 'p' / 'preictal'
+    if s in ("p", "preictal"):
+        return LABEL_CATEGORY_PREICTAL
+    if s.startswith("p") or s.startswith("p_"):
+        suffix = s[2:] if s.startswith("p_") else s[1:]
+        if suffix in KNOWN_SEIZURE_TYPES or not suffix:
+            return LABEL_CATEGORY_PREICTAL
+
+    # 4. Excluded / Postictal / Continuing / Artifact variants
+    if s in ("x", "q", "c", "postictal", "continuing", "exclusion") or s in EXCLUSION_TAGS:
+        return LABEL_CATEGORY_EXCLUDED
+    if s.startswith("q") or s.startswith("q_") or s.startswith("c") or s.startswith("c_") or s.startswith("x") or s.startswith("x_"):
+        suffix = s[2:] if (s.startswith("q_") or s.startswith("c_") or s.startswith("x_")) else s[1:]
+        if suffix in KNOWN_SEIZURE_TYPES or not suffix:
+            return LABEL_CATEGORY_EXCLUDED
+
+    # 5. Fail-loud on anything unrecognized
+    raise ValueError(
+        f"Unrecognized dataset label '{raw_val}' (normalized: '{s}'). "
+        f"Label must be explicitly allow-listed into one of {{background, preictal, ictal, excluded}}."
+    )
+
+
 def _is_background_label(raw_val) -> bool:
     """Return True if raw_val represents a background / non-seizure window."""
-    s = str(raw_val).strip().lower()
-    if s in ("0", "0.0", "-1", "none", "nan", "null", "") or s.startswith("b") or s.startswith("0"):
-        return True
-    return False
-
-
-# Labels that are NOT ictal (used to identify pure ictal rows).
-# Background (b*), preictal (p*), postictal (q*), continuing (c*), exclusion (x*).
-_NON_ICTAL_PREFIXES: Tuple[str, ...] = ("b", "p", "q", "c", "x")
+    return classify_label(raw_val) == LABEL_CATEGORY_BACKGROUND
 
 
 def _build_valid_ictal_mask(
@@ -508,10 +571,10 @@ def _build_valid_ictal_mask(
 
         prev_lbl: Optional[str] = None
         for idx, lbl in zip(orig_idx, lbls):
-            is_ictal = not any(lbl.startswith(pf) for pf in _NON_ICTAL_PREFIXES)
+            is_ictal = (classify_label(lbl) == LABEL_CATEGORY_ICTAL)
             if is_ictal:
                 # Only valid if immediately preceded by a preictal (p*) window
-                if prev_lbl is None or not prev_lbl.startswith("p"):
+                if prev_lbl is None or classify_label(prev_lbl) != LABEL_CATEGORY_PREICTAL:
                     keep[idx] = False
             prev_lbl = lbl  # track ALL labels so c*→ictal is detected
 
@@ -644,7 +707,7 @@ class EEGWindowDataset(Dataset):
         # Without this, bg can represent 90%+ of the dataset and the model
         # learns to always predict bg regardless of loss weights.
         if max_bg_ratio is not None:
-            bg_mask = self.df[label_col].astype(str).str.startswith("b")
+            bg_mask = self.df[label_col].apply(lambda l: classify_label(l) == LABEL_CATEGORY_BACKGROUND)
             n_nonbg = int((~bg_mask).sum())
             n_bg = int(bg_mask.sum())
             max_bg = int(n_nonbg * max_bg_ratio)
@@ -710,7 +773,9 @@ class EEGWindowDataset(Dataset):
         # Label Mapping
         if binary_preictal:
             # Map preictal (p*) -> 1, all others -> 0
-            self.df[label_col] = self.df["_raw_label"].apply(lambda l: 1 if l.startswith("p") else 0)
+            self.df[label_col] = self.df["_raw_label"].apply(
+                lambda l: 1 if classify_label(l) == LABEL_CATEGORY_PREICTAL else 0
+            )
             label_map = {0: 0, 1: 1}
         elif label_map is None:
             uniq = sorted(self.df[label_col].dropna().unique().tolist())
@@ -731,8 +796,8 @@ class EEGWindowDataset(Dataset):
         # preictal windows: how long from this window's end until the seizure
         # actually starts -- not just how long the window itself is.
         self._session_ictal_onsets: dict = {}
-        is_ictal = ~self.df["_raw_label"].astype(str).apply(
-            lambda l: any(l.startswith(pf) for pf in _NON_ICTAL_PREFIXES)
+        is_ictal = self.df["_raw_label"].apply(
+            lambda l: classify_label(l) == LABEL_CATEGORY_ICTAL
         )
         for session_key, grp in self.df[is_ictal].groupby("session_key"):
             self._session_ictal_onsets[session_key] = sorted(grp[start_col].astype(float).tolist())
@@ -923,17 +988,18 @@ class EEGWindowDataset(Dataset):
         # Multi-task ground truth targets:
         # Occurrence (IF): 0 for non-seizure/background, 1 for preictal/ictal
         raw_str = str(raw_label)
+        cat = classify_label(raw_label)
         if getattr(self, "binary_preictal", False):
             has_seizure = 1.0 if label == 1 else 0.0
         else:
-            has_seizure = 0.0 if _is_background_label(raw_label) else 1.0
+            has_seizure = 0.0 if cat == LABEL_CATEGORY_BACKGROUND else 1.0
         occurrence_t = torch.tensor(has_seizure, dtype=torch.float32)
 
         # Timing offset (WHEN): Relative onset time (in seconds) relative to the generated data window
         # For preictal windows (p*), relative onset is the distance/duration from preictal end to seizure start
         onset_time: Optional[float] = None
         has_horizon = False
-        if raw_str.startswith("p"):
+        if cat == LABEL_CATEGORY_PREICTAL:
             onsets = self._session_ictal_onsets.get(session_key, [])
             pos = bisect.bisect_left(onsets, stop_time)
             if pos < len(onsets):
