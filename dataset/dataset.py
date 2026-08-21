@@ -27,9 +27,11 @@ from dataset.label_utils import (
     LABEL_CATEGORY_BACKGROUND,
     LABEL_CATEGORY_PREICTAL,
     LABEL_CATEGORY_ICTAL,
+    SEIZURE_TYPE_CLASSES,
     _build_valid_ictal_mask,
     _is_background_label,
     classify_label,
+    extract_seizure_type,
 )
 from dataset.reporting import _print_dataset_summary
 
@@ -194,6 +196,19 @@ class EEGWindowDataset(Dataset):
         self.label_map = label_map
         self.num_classes = len(set(label_map.values()))
 
+        # Seizure-TYPE target, independent of the binary occurrence/preictal
+        # flag above. `label`/`occurrence` answer "is a seizure imminent";
+        # `seizure_type` answers "which kind" (fnsz/gnsz/...), so the type
+        # classification head has a real, distinct task to learn instead of
+        # duplicating occurrence. See extract_seizure_type() in label_utils.
+        self.df["_seizure_type_raw"] = self.df["_raw_label"].apply(extract_seizure_type)
+        self.type_classes = SEIZURE_TYPE_CLASSES
+        self.type_label_map = {t: i for i, t in enumerate(self.type_classes)}
+        self.num_type_classes = len(self.type_classes)
+        self.df["_seizure_type_idx"] = self.df["_seizure_type_raw"].apply(
+            lambda t: self.type_label_map.get(t, -1)
+        )
+
         self.status_col = status_col
         self.return_dict = return_dict
         self.timing_norm = timing_norm
@@ -249,6 +264,34 @@ class EEGWindowDataset(Dataset):
         for c in range(num_cls):
             cnt = counts.get(c, 1)
             raw_w = total / (num_cls * max(1, cnt))
+            w = min(raw_w, 25.0)
+            weights.append(w)
+        t = torch.tensor(weights, dtype=torch.float32)
+        if device is not None:
+            t = t.to(device)
+        return t
+
+    def seizure_type_class_weights_tensor(
+        self,
+        indices: Optional[list] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Inverse-frequency class weights for the seizure-TYPE head, computed
+        only over rows with a valid (>= 0) seizure type (i.e. actual
+        preictal/ictal windows -- background rows have no type and are
+        excluded from this computation, matching how the type loss/metric
+        are masked to occ==1 samples during training/validation)."""
+        col = self.df["_seizure_type_idx"]
+        if indices is not None:
+            col = col.iloc[indices]
+        valid = col[col >= 0]
+        counts = valid.value_counts().to_dict()
+        total = sum(counts.values())
+        num_cls = self.num_type_classes
+        weights = []
+        for c in range(num_cls):
+            cnt = counts.get(c, 1)
+            raw_w = (total / (num_cls * max(1, cnt))) if total > 0 else 1.0
             w = min(raw_w, 25.0)
             weights.append(w)
         t = torch.tensor(weights, dtype=torch.float32)
@@ -360,6 +403,7 @@ class EEGWindowDataset(Dataset):
             return window_t, {
                 "label": label_t,
                 "occurrence": torch.tensor(0.0, dtype=torch.float32),
+                "seizure_type": torch.tensor(-1, dtype=torch.long),
                 "onset_offset": torch.tensor(0.0, dtype=torch.float32),
                 "status": torch.tensor(1, dtype=torch.long),
                 "horizon_window": torch.zeros((nc, self.horizon_window_samples), dtype=torch.float32),
@@ -393,6 +437,9 @@ class EEGWindowDataset(Dataset):
         else:
             has_seizure = 0.0 if cat == LABEL_CATEGORY_BACKGROUND else 1.0
         occurrence_t = torch.tensor(has_seizure, dtype=torch.float32)
+
+        seizure_type_idx = int(row["_seizure_type_idx"]) if "_seizure_type_idx" in row else -1
+        seizure_type_t = torch.tensor(seizure_type_idx, dtype=torch.long)
 
         onset_time: Optional[float] = None
         has_horizon = False
@@ -429,6 +476,7 @@ class EEGWindowDataset(Dataset):
         targets = {
             "label": label_t,
             "occurrence": occurrence_t,
+            "seizure_type": seizure_type_t,
             "onset_offset": onset_offset_t,
             "status": status_t,
             "horizon_window": horizon_window_t,

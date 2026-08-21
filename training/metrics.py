@@ -52,13 +52,22 @@ def compute_confusion_matrix(
 
         windows = windows.to(device, non_blocking=True)
         if isinstance(targets, dict):
-            labels = targets["label"].to(device, non_blocking=True)
-            occ_targets = targets["occurrence"].to(device, non_blocking=True).unsqueeze(-1)
+            seizure_type_targets = targets.get("seizure_type")
+            if seizure_type_targets is not None:
+                seizure_type_targets = seizure_type_targets.to(device, non_blocking=True)
         else:
-            labels = targets.to(device, non_blocking=True)
-            occ_targets = (labels > 0).float().unsqueeze(-1)
+            seizure_type_targets = None
 
-        pos_mask = (occ_targets.squeeze(-1) > 0)
+        # type_mask uses the dedicated seizure_type target, NOT
+        # occurrence/label -- occurrence and label are the same binary flag
+        # under binary_preictal, so masking by occurrence here would make
+        # every included true-label a 1 by construction (this was the bug:
+        # it produced a "100% accurate" confusion matrix with zero support
+        # for class 0 regardless of what the model predicted).
+        if seizure_type_targets is not None:
+            type_mask = seizure_type_targets >= 0
+        else:
+            type_mask = torch.zeros(windows.shape[0], dtype=torch.bool, device=device)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             outputs = model(
@@ -66,11 +75,12 @@ def compute_confusion_matrix(
                 horizon_steps=horizon_tokens,
                 use_horizon_context=use_horizon_context,
             )
-            type_preds = outputs["type_logits"].argmax(dim=-1)
+            type_logits = outputs["preictal_type_logits"] if "preictal_type_logits" in outputs else outputs["type_logits"]
+            type_preds = type_logits.argmax(dim=-1)
 
-        if pos_mask.any():
-            for t, p in zip(labels[pos_mask].view(-1).tolist(), type_preds[pos_mask].view(-1).tolist()):
-                if t < cm.shape[0] and p < cm.shape[1]:
+        if type_mask.any():
+            for t, p in zip(seizure_type_targets[type_mask].view(-1).tolist(), type_preds[type_mask].view(-1).tolist()):
+                if 0 <= t < cm.shape[0] and 0 <= p < cm.shape[1]:
                     cm[t, p] += 1
 
     return cm

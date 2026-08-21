@@ -99,6 +99,43 @@ def classify_label(raw_val: Any) -> str:
     )
 
 
+SEIZURE_TYPE_CLASSES = sorted(KNOWN_SEIZURE_TYPES)
+
+
+def extract_seizure_type(raw_val: Any) -> str:
+    """Extract the base seizure subtype (e.g. 'gnsz') from a raw annotation label.
+
+    This is distinct from `classify_label`: `classify_label` answers "is this
+    window background/preictal/ictal/excluded", while this answers "which of
+    the KNOWN_SEIZURE_TYPES does the associated seizure belong to". Used to
+    build a genuine multi-class type target that is independent of the binary
+    occurrence/preictal flag -- see the "type vs occurrence" note in dataset.py.
+
+    Returns LABEL_CATEGORY_BACKGROUND (used here as a sentinel, not a real
+    type) when no seizure type can be determined, e.g. for background windows
+    or a bare "p"/"preictal" label with no encoded subtype.
+    """
+    if raw_val is None or (isinstance(raw_val, float) and np.isnan(raw_val)):
+        return LABEL_CATEGORY_BACKGROUND
+
+    s = str(raw_val).strip().lower()
+    cat = classify_label(raw_val)
+
+    if cat == LABEL_CATEGORY_BACKGROUND or cat == LABEL_CATEGORY_EXCLUDED:
+        return LABEL_CATEGORY_BACKGROUND
+
+    if cat == LABEL_CATEGORY_ICTAL:
+        return s if s in KNOWN_SEIZURE_TYPES else LABEL_CATEGORY_BACKGROUND
+
+    if cat == LABEL_CATEGORY_PREICTAL:
+        if s in ("p", "preictal"):
+            return LABEL_CATEGORY_BACKGROUND
+        suffix = s[2:] if s.startswith("p_") else s[1:]
+        return suffix if suffix in KNOWN_SEIZURE_TYPES else LABEL_CATEGORY_BACKGROUND
+
+    return LABEL_CATEGORY_BACKGROUND
+
+
 def _is_background_label(raw_val: Any) -> bool:
     """Return True if raw_val represents a background / non-seizure window."""
     return classify_label(raw_val) == LABEL_CATEGORY_BACKGROUND

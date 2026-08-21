@@ -186,17 +186,27 @@ def main():
         use_session_batching=not args.no_session_batching,
     )
 
+    # num_classes (dataset.num_classes) is the binary occurrence/preictal
+    # class count (always 2) -- it is NOT the type head's output size. The
+    # type head classifies seizure SUBTYPE (fnsz/gnsz/...), so it must be
+    # sized off dataset.num_type_classes instead. Wiring it to num_classes
+    # previously meant the type head only ever had 2 output logits, matching
+    # the (buggy) binary type target it was being trained against.
     num_classes = dataset.num_classes
+    num_type_classes = dataset.num_type_classes
     sample_window, _ = dataset[0]
     n_channels, n_samples = sample_window.shape
 
-    logger.info(f"Dataset loaded: {len(dataset)} samples | {num_classes} classes | shape: ({n_channels}, {n_samples})")
+    logger.info(
+        f"Dataset loaded: {len(dataset)} samples | {num_classes} occurrence classes | "
+        f"{num_type_classes} seizure-type classes ({dataset.type_classes}) | shape: ({n_channels}, {n_samples})"
+    )
 
     if args.model_arch in ("simplified_eeg_conformer", "simplified_conformer"):
         model = SimplifiedEEGConformer(
             n_channels=n_channels,
             embed_dim=args.embed_dim,
-            num_classes=num_classes,
+            num_classes=num_type_classes,
             default_horizon_tokens=args.horizon_tokens,
         ).to(device)
         logger.info("Instantiated SimplifiedEEGConformer model architecture")
@@ -204,7 +214,7 @@ def main():
         model = CausalEEGConformer(
             n_channels=n_channels,
             embed_dim=args.embed_dim,
-            num_classes=num_classes,
+            num_classes=num_type_classes,
             default_horizon_tokens=args.horizon_tokens,
         ).to(device)
         logger.info("Instantiated CausalEEGConformer model architecture")
@@ -226,9 +236,9 @@ def main():
 
     _subsets = split_by_column(dataset)
     _train_indices = _subsets["train"].indices if hasattr(_subsets.get("train", None), "indices") else None
-    type_class_weights = dataset.class_weights_tensor(indices=_train_indices, device=device)
+    type_class_weights = dataset.seizure_type_class_weights_tensor(indices=_train_indices, device=device)
     occ_pos_weight = dataset.occ_pos_weight(indices=_train_indices, device=device)
-    logger.info(f"Type class weights: {type_class_weights.tolist()}")
+    logger.info(f"Type class weights ({dataset.type_classes}): {type_class_weights.tolist()}")
     logger.info(f"Occurrence pos_weight: {occ_pos_weight.item():.4f}")
 
     scheduler = None
@@ -291,7 +301,10 @@ def main():
                 f"{args.horizon_gate_threshold}) — Tasks 2/3 will see horizon context from next epoch on."
             )
 
-        val_loss, val_type_acc, val_occ_acc, val_macro_f1, val_macro_precision, val_macro_recall = validate(
+        (
+            val_loss, val_type_acc, val_occ_acc, val_macro_f1, val_macro_precision, val_macro_recall,
+            val_occ_cm, val_occ_precision, val_occ_recall, val_occ_f1,
+        ) = validate(
             model,
             val_loader,
             device,
@@ -303,7 +316,7 @@ def main():
             use_horizon_context=horizon_gate_open,
             use_focal_loss=args.use_focal_loss,
             focal_gamma=args.focal_gamma,
-            num_classes=num_classes,
+            num_classes=num_type_classes,
         )
 
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -321,6 +334,9 @@ def main():
                 "val_macro_f1": val_macro_f1,
                 "val_macro_precision": val_macro_precision,
                 "val_macro_recall": val_macro_recall,
+                "val_occ_f1": val_occ_f1,
+                "val_occ_precision": val_occ_precision,
+                "val_occ_recall": val_occ_recall,
                 "best_val_loss": min(best_val_loss, val_loss),
                 "best_macro_f1": max(best_macro_f1, val_macro_f1),
             },
@@ -354,17 +370,28 @@ def main():
             f"Val Loss: {val_loss:.4f} | Val Occ Acc: {val_occ_acc * 100:.2f}% | Val Type Acc: {val_type_acc * 100:.2f}% | "
             f"Val Macro-F1: {val_macro_f1:.4f} (P: {val_macro_precision:.4f} / R: {val_macro_recall:.4f})"
         )
+        # Occupancy accuracy alone can look fine while the head has actually
+        # collapsed to majority-class prediction under imbalance -- compare
+        # against the trivial majority-class baseline (support ratio in
+        # occ_cm) to tell real learning apart from that. occ_f1 uses macro
+        # averaging so it isn't inflated by the majority class either.
+        occ_support = val_occ_cm.sum(dim=1).tolist()
+        logger.info(
+            f"           Occ confusion (support {occ_support}) | "
+            f"Occ Macro-F1: {val_occ_f1:.4f} (P: {val_occ_precision:.4f} / R: {val_occ_recall:.4f})"
+        )
 
     logger.info("Training complete. Computing final confusion matrix on validation set...")
-    idx_to_label = {v: k for k, v in dataset.label_map.items()}
-    label_names = [str(idx_to_label.get(i, i)) for i in range(num_classes)]
+    # Labeled by seizure TYPE (fnsz/gnsz/...), not by the binary
+    # occurrence/preictal flag -- dataset.num_classes/label_map describe the
+    # latter and would mislabel this matrix.
     cm = compute_confusion_matrix(
         model,
         val_loader,
         device,
-        num_classes,
+        num_type_classes,
         use_amp=use_amp,
         horizon_tokens=args.horizon_tokens,
         use_horizon_context=horizon_gate_open,
     )
-    log_confusion_matrix(cm, label_names=label_names)
+    log_confusion_matrix(cm, label_names=dataset.type_classes)

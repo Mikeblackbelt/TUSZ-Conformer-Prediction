@@ -62,10 +62,14 @@ def train_epoch(
             labels = targets["label"].to(device, non_blocking=True)
             occ_targets = targets["occurrence"].to(device, non_blocking=True).unsqueeze(-1)
             onset_targets = targets["onset_offset"].to(device, non_blocking=True).unsqueeze(-1)
+            seizure_type_targets = targets.get("seizure_type")
+            if seizure_type_targets is not None:
+                seizure_type_targets = seizure_type_targets.to(device, non_blocking=True)
         else:
             labels = targets.to(device, non_blocking=True)
             occ_targets = (labels > 0).float().unsqueeze(-1)
             onset_targets = torch.zeros_like(occ_targets)
+            seizure_type_targets = None
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             outputs = model(
@@ -87,9 +91,17 @@ def train_epoch(
             occ_loss = bce_criterion(occ_logits, occ_targets)
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
 
-            pos_mask = (occ_targets.squeeze(-1) > 0)
-            if pos_mask.any():
-                type_loss = ce_criterion(type_logits[pos_mask], labels[pos_mask])
+            # NOTE: type_mask is intentionally built from `seizure_type_targets`
+            # (an independent label of *which* seizure subtype), not from
+            # occ_targets/labels -- using occ_targets here would make the
+            # "positive" set and the type labels the same variable, which
+            # trivializes the type task. See dataset.py's seizure_type field.
+            if seizure_type_targets is not None:
+                type_mask = seizure_type_targets >= 0
+            else:
+                type_mask = torch.zeros_like(occ_targets.squeeze(-1), dtype=torch.bool)
+            if type_mask.any():
+                type_loss = ce_criterion(type_logits[type_mask], seizure_type_targets[type_mask])
             else:
                 type_loss = type_logits.sum() * 0.0
 
@@ -176,6 +188,7 @@ def validate(
     total_pos_samples = 0
 
     cm = torch.zeros(num_classes or 2, num_classes or 2, dtype=torch.long)
+    occ_cm = torch.zeros(2, 2, dtype=torch.long)
 
     if use_focal_loss:
         ce_criterion = FocalCrossEntropyLoss(weight=type_class_weights, gamma=focal_gamma, label_smoothing=0.1)
@@ -195,12 +208,21 @@ def validate(
             labels = targets["label"].to(device, non_blocking=True)
             occ_targets = targets["occurrence"].to(device, non_blocking=True).unsqueeze(-1)
             onset_targets = targets["onset_offset"].to(device, non_blocking=True).unsqueeze(-1)
+            seizure_type_targets = targets.get("seizure_type")
+            if seizure_type_targets is not None:
+                seizure_type_targets = seizure_type_targets.to(device, non_blocking=True)
         else:
             labels = targets.to(device, non_blocking=True)
             occ_targets = (labels > 0).float().unsqueeze(-1)
             onset_targets = torch.zeros_like(occ_targets)
+            seizure_type_targets = None
 
-        pos_mask = (occ_targets.squeeze(-1) > 0)
+        # type_mask (for the seizure-TYPE head) is deliberately independent of
+        # occ_targets/labels -- see the matching note in train_epoch().
+        if seizure_type_targets is not None:
+            type_mask = seizure_type_targets >= 0
+        else:
+            type_mask = torch.zeros_like(occ_targets.squeeze(-1), dtype=torch.bool)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             outputs = model(
@@ -221,8 +243,8 @@ def validate(
             occ_loss = bce_criterion(occ_logits, occ_targets)
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
 
-            if pos_mask.any():
-                type_loss = ce_criterion(type_logits[pos_mask], labels[pos_mask])
+            if type_mask.any():
+                type_loss = ce_criterion(type_logits[type_mask], seizure_type_targets[type_mask])
             else:
                 type_loss = type_logits.sum() * 0.0
 
@@ -238,18 +260,39 @@ def validate(
         type_preds = type_logits.argmax(dim=-1)
         occ_preds = (torch.sigmoid(occ_logits) >= 0.5).float()
 
-        if pos_mask.any():
-            correct_type += (type_preds[pos_mask] == labels[pos_mask]).sum().item()
-            total_pos_samples += pos_mask.sum().item()
-            for t, p in zip(labels[pos_mask].view(-1).tolist(), type_preds[pos_mask].view(-1).tolist()):
-                if t < cm.shape[0] and p < cm.shape[1]:
+        if type_mask.any():
+            correct_type += (type_preds[type_mask] == seizure_type_targets[type_mask]).sum().item()
+            total_pos_samples += type_mask.sum().item()
+            for t, p in zip(seizure_type_targets[type_mask].view(-1).tolist(), type_preds[type_mask].view(-1).tolist()):
+                if 0 <= t < cm.shape[0] and 0 <= p < cm.shape[1]:
                     cm[t, p] += 1
 
         correct_occ += (occ_preds == occ_targets).sum().item()
         total_samples += labels.size(0)
 
+        # Occupancy confusion matrix -- this is the piece that was missing
+        # before: occ_acc alone looks fine even when the head has collapsed
+        # to majority-class prediction under imbalance. Per-class support/
+        # precision/recall in occ_cm exposes that directly.
+        occ_true_idx = occ_targets.squeeze(-1).long()
+        occ_pred_idx = occ_preds.squeeze(-1).long()
+        for t, p in zip(occ_true_idx.view(-1).tolist(), occ_pred_idx.view(-1).tolist()):
+            occ_cm[t, p] += 1
+
     num_batches = len(val_loader)
     type_acc = correct_type / total_pos_samples if total_pos_samples > 0 else 0.0
     occ_acc = correct_occ / total_samples if total_samples > 0 else 0.0
     macro_precision, macro_recall, macro_f1 = _macro_prf1_from_confusion(cm)
-    return total_loss / num_batches, type_acc, occ_acc, macro_f1, macro_precision, macro_recall
+    occ_precision, occ_recall, occ_f1 = _macro_prf1_from_confusion(occ_cm)
+    return (
+        total_loss / num_batches,
+        type_acc,
+        occ_acc,
+        macro_f1,
+        macro_precision,
+        macro_recall,
+        occ_cm,
+        occ_precision,
+        occ_recall,
+        occ_f1,
+    )
