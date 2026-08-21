@@ -275,12 +275,22 @@ class EEGWindowDataset(Dataset):
         self,
         indices: Optional[list] = None,
         device: Optional[torch.device] = None,
+        cap: float = 8.0,
     ) -> torch.Tensor:
         """Inverse-frequency class weights for the seizure-TYPE head, computed
         only over rows with a valid (>= 0) seizure type (i.e. actual
         preictal/ictal windows -- background rows have no type and are
         excluded from this computation, matching how the type loss/metric
-        are masked to occ==1 samples during training/validation)."""
+        are masked to occ==1 samples during training/validation).
+
+        `cap` bounds how large any single class's weight can get. Lowered
+        from an earlier 25.0 default: with several seizure subtypes this rare
+        in the TUSZ split, a 25x weight on a handful of examples was
+        dominating the joint loss and producing very large, noisy gradients
+        (visible as elevated `gnorm` and near-zero Val Type Acc). If most
+        classes still saturate at `cap`, consider merging the rarest types
+        into an explicit "other" bucket instead of raising the cap further.
+        """
         col = self.df["_seizure_type_idx"]
         if indices is not None:
             col = col.iloc[indices]
@@ -292,7 +302,7 @@ class EEGWindowDataset(Dataset):
         for c in range(num_cls):
             cnt = counts.get(c, 1)
             raw_w = (total / (num_cls * max(1, cnt))) if total > 0 else 1.0
-            w = min(raw_w, 25.0)
+            w = min(raw_w, cap)
             weights.append(w)
         t = torch.tensor(weights, dtype=torch.float32)
         if device is not None:

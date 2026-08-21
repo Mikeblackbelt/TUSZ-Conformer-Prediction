@@ -8,6 +8,7 @@ import argparse
 import logging
 import math
 import os
+from typing import Optional
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR
@@ -98,6 +99,25 @@ def main():
         type=float,
         default=1.0,
         help="Loss weight for real-horizon supervision (default: 1.0).",
+    )
+    parser.add_argument(
+        "--horizon-ramp-epochs",
+        type=int,
+        default=3,
+        help=(
+            "Number of epochs over which --horizon-loss-weight ramps linearly "
+            "from ~0 to its full value after the horizon curriculum gate "
+            "opens, instead of applying full weight the instant the gate "
+            "opens (default: 3). Softens the loss/gradient transition when "
+            "the model starts conditioning on real horizon context."
+        ),
+    )
+    parser.add_argument(
+        "--type-weight-cap",
+        type=float,
+        default=8.0,
+        help="Max per-class weight for the seizure-type loss (default: 8.0). "
+             "Lower this further if most classes saturate at the cap.",
     )
     parser.add_argument(
         "--exclude-labels",
@@ -236,7 +256,9 @@ def main():
 
     _subsets = split_by_column(dataset)
     _train_indices = _subsets["train"].indices if hasattr(_subsets.get("train", None), "indices") else None
-    type_class_weights = dataset.seizure_type_class_weights_tensor(indices=_train_indices, device=device)
+    type_class_weights = dataset.seizure_type_class_weights_tensor(
+        indices=_train_indices, device=device, cap=args.type_weight_cap
+    )
     occ_pos_weight = dataset.occ_pos_weight(indices=_train_indices, device=device)
     logger.info(f"Type class weights ({dataset.type_classes}): {type_class_weights.tolist()}")
     logger.info(f"Occurrence pos_weight: {occ_pos_weight.item():.4f}")
@@ -270,11 +292,29 @@ def main():
 
     logger.info(f"Gradient clipping max_norm={args.max_grad_norm}")
     horizon_gate_open = False
+    gate_open_epoch: Optional[int] = None
     best_macro_f1 = -1.0
 
     logger.info("Starting Multi-Task Training Loop...")
     for epoch in range(start_epoch, args.epochs + 1):
         logger.info(f"--- Epoch {epoch:02d}/{args.epochs:02d} ---")
+
+        # Fix 2: ramp horizon_loss_weight in linearly over --horizon-ramp-epochs
+        # after the gate opens, instead of jumping straight to full weight the
+        # instant the model starts conditioning on real horizon context. While
+        # the gate is still closed, horizon_loss stays small on its own, so
+        # full weight is fine and left untouched.
+        if not horizon_gate_open or gate_open_epoch is None:
+            current_horizon_weight = args.horizon_loss_weight
+        else:
+            epochs_since_gate = epoch - gate_open_epoch
+            ramp_fraction = min(1.0, (epochs_since_gate + 1) / max(1, args.horizon_ramp_epochs))
+            current_horizon_weight = args.horizon_loss_weight * ramp_fraction
+            logger.info(
+                f"Horizon loss weight ramp: {current_horizon_weight:.4f} / {args.horizon_loss_weight:.4f} "
+                f"(epoch {epochs_since_gate + 1}/{args.horizon_ramp_epochs} since gate opened)"
+            )
+
         train_loss, gen_l, occ_l, time_l, type_l, horizon_l = train_epoch(
             model,
             train_loader,
@@ -287,7 +327,7 @@ def main():
             occ_pos_weight=occ_pos_weight,
             type_class_weights=type_class_weights,
             timing_weight=args.timing_weight,
-            horizon_loss_weight=args.horizon_loss_weight,
+            horizon_loss_weight=current_horizon_weight,
             max_grad_norm=args.max_grad_norm,
             use_horizon_context=horizon_gate_open,
             use_focal_loss=args.use_focal_loss,
@@ -296,10 +336,33 @@ def main():
 
         if not horizon_gate_open and gen_l < args.horizon_gate_threshold:
             horizon_gate_open = True
+            gate_open_epoch = epoch + 1
             logger.info(
                 f"Horizon curriculum gate OPENED (gen_loss {gen_l:.4f} < threshold "
-                f"{args.horizon_gate_threshold}) — Tasks 2/3 will see horizon context from next epoch on."
+                f"{args.horizon_gate_threshold}) — Tasks 2/3 will see horizon context from next epoch on. "
+                f"Horizon loss weight will ramp over the next {args.horizon_ramp_epochs} epoch(s)."
             )
+            # Fix 1: decouple the LR warm-restart schedule from the curriculum
+            # change. Without this, a pending CosineAnnealingWarmRestarts
+            # restart (LR jumping back to max) can land on the exact same
+            # epoch the gate opens -- two independent sources of instability
+            # stacking on top of each other. Rebuilding the scheduler here
+            # starts a fresh cosine cycle from the CURRENT (already-decayed)
+            # LR instead of snapping back to max_lr at this moment.
+            if scheduler is not None and args.scheduler_type == "cosine":
+                current_lr = optimizer.param_groups[0]["lr"]
+                steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
+                t0 = steps_per_epoch * args.restart_period_epochs
+                scheduler = CosineAnnealingWarmRestarts(
+                    optimizer,
+                    T_0=t0,
+                    T_mult=2,
+                    eta_min=1e-6,
+                )
+                logger.info(
+                    f"Scheduler reinitialized at horizon-gate-open (base_lr={current_lr:.2e}) "
+                    f"to avoid restart/curriculum overlap"
+                )
 
         (
             val_loss, val_type_acc, val_occ_acc, val_macro_f1, val_macro_precision, val_macro_recall,
