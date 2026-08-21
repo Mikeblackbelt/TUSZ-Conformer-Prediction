@@ -17,7 +17,23 @@ from dataset.samplers import build_dataloaders, split_by_column
 from models.conformer import CausalEEGConformer
 from models.simplified_conformer import SimplifiedEEGConformer
 from training.metrics import compute_confusion_matrix, log_confusion_matrix
-from training.trainer import train_epoch, validate
+from training.trainer import set_model_stage, train_epoch, validate
+
+
+def get_training_stage(epoch: int, args) -> int:
+    """Determine training stage for given epoch:
+    - Stage 1: Conformer backbone & generative prediction
+    - Stage 2: Binary occurrence & timing (IF / WHEN)
+    - Stage 3: Multi-class seizure type classification (WHAT)
+    """
+    if getattr(args, "no_staged_training", False):
+        return 3
+    if epoch <= args.stage1_epochs:
+        return 1
+    elif epoch <= (args.stage1_epochs + args.stage2_epochs):
+        return 2
+    else:
+        return 3
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +67,31 @@ def main():
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile()")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP mixed-precision training")
     parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--use-scheduler", action="store_true", help="Enable LR scheduler")
+    parser.add_argument("--no-scheduler", action="store_true", help="Disable LR scheduler")
+    parser.add_argument("--use-scheduler", action="store_true", default=True, help="Enable LR scheduler (enabled by default)")
     parser.add_argument(
         "--scheduler-type",
         default="cosine",
         choices=["cosine", "onecycle"],
         help="LR scheduler: 'cosine' (CosineAnnealingWarmRestarts, default) or 'onecycle' (OneCycleLR)",
+    )
+    parser.add_argument(
+        "--t-mult",
+        type=int,
+        default=1,
+        help="CosineAnnealingWarmRestarts T_mult factor (default: 1 for periodic cycling).",
+    )
+    parser.add_argument(
+        "--occ-loss-weight",
+        type=float,
+        default=2.0,
+        help="Loss weight multiplier for binary occurrence/preictal loss (default: 2.0).",
+    )
+    parser.add_argument(
+        "--occ-threshold",
+        type=float,
+        default=None,
+        help="Probability threshold for occurrence predictions (default: auto-calibrated from pos_weight).",
     )
     parser.add_argument(
         "--timing-weight",
@@ -69,6 +104,23 @@ def main():
         type=float,
         default=300.0,
         help="Divides the WHEN target by this before training (default: 300.0)",
+    )
+    parser.add_argument(
+        "--stage1-epochs",
+        type=int,
+        default=4,
+        help="Number of epochs for Stage 1: Conformer backbone & generative pre-training (default: 4).",
+    )
+    parser.add_argument(
+        "--stage2-epochs",
+        type=int,
+        default=4,
+        help="Number of epochs for Stage 2: Binary occurrence & onset timing learning (default: 4).",
+    )
+    parser.add_argument(
+        "--no-staged-training",
+        action="store_true",
+        help="Disable staged training (train all layers and heads jointly from epoch 1).",
     )
     parser.add_argument(
         "--restart-period-epochs",
@@ -170,6 +222,8 @@ def main():
             latest = max(ckpt_files, key=lambda x: int(x.split("_")[1].split(".")[0]))
             ckpt_path = os.path.join(args.output_dir, latest)
 
+    horizon_gate_open = False
+    gate_open_epoch: Optional[int] = None
     loaded_state_dict = None
     loaded_optimizer_state = None
     loaded_scheduler_state = None
@@ -181,6 +235,10 @@ def main():
         loaded_scheduler_state = checkpoint.get("scheduler_state_dict")
         start_epoch = checkpoint.get("epoch", 1) + 1
         best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
+        horizon_gate_open = checkpoint.get("horizon_gate_open", False)
+        gate_open_epoch = checkpoint.get("gate_open_epoch", None)
+        if horizon_gate_open:
+            logger.info(f"Restored curriculum state: horizon_gate_open=True (opened at epoch {gate_open_epoch})")
 
     exclude_labels = tuple(
         t.strip() for t in args.exclude_labels.split(",") if t.strip()
@@ -264,7 +322,8 @@ def main():
     logger.info(f"Occurrence pos_weight: {occ_pos_weight.item():.4f}")
 
     scheduler = None
-    if args.use_scheduler:
+    use_scheduler = not args.no_scheduler
+    if use_scheduler:
         steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
         remaining_epochs = args.epochs - start_epoch + 1
         total_steps = steps_per_epoch * remaining_epochs
@@ -281,39 +340,49 @@ def main():
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
                 T_0=t0,
-                T_mult=2,
+                T_mult=args.t_mult,
                 eta_min=1e-6,
             )
-            logger.info(f"Scheduler: CosineAnnealingWarmRestarts | T_0={t0} ({args.restart_period_epochs} epoch(s)), T_mult=2, eta_min=1e-6")
+            logger.info(f"Scheduler: CosineAnnealingWarmRestarts | T_0={t0} ({args.restart_period_epochs} epoch(s)), T_mult={args.t_mult}, eta_min=1e-6")
 
         if loaded_scheduler_state is not None:
             scheduler.load_state_dict(loaded_scheduler_state)
             logger.info("Scheduler state restored from checkpoint")
 
     logger.info(f"Gradient clipping max_norm={args.max_grad_norm}")
-    horizon_gate_open = False
-    gate_open_epoch: Optional[int] = None
     best_macro_f1 = -1.0
 
     logger.info("Starting Multi-Task Training Loop...")
+    previous_stage: Optional[int] = None
     for epoch in range(start_epoch, args.epochs + 1):
-        logger.info(f"--- Epoch {epoch:02d}/{args.epochs:02d} ---")
+        current_stage = get_training_stage(epoch, args)
+        set_model_stage(model, current_stage)
 
-        # Fix 2: ramp horizon_loss_weight in linearly over --horizon-ramp-epochs
-        # after the gate opens, instead of jumping straight to full weight the
-        # instant the model starts conditioning on real horizon context. While
-        # the gate is still closed, horizon_loss stays small on its own, so
-        # full weight is fine and left untouched.
+        if previous_stage != current_stage:
+            stage_names = {
+                1: "Stage 1: Conformer Backbone & Generative Pre-training",
+                2: "Stage 2: Binary Occurrence (IF) & Timing (WHEN)",
+                3: "Stage 3: Multi-Class Seizure Subtype Classification (WHAT)",
+            }
+            logger.info(f"==> Active Training Stage: {stage_names.get(current_stage, f'Stage {current_stage}')} <==")
+            previous_stage = current_stage
+
+        logger.info(f"--- Epoch {epoch:02d}/{args.epochs:02d} [Stage {current_stage}] ---")
+
         if not horizon_gate_open or gate_open_epoch is None:
             current_horizon_weight = args.horizon_loss_weight
         else:
             epochs_since_gate = epoch - gate_open_epoch
-            ramp_fraction = min(1.0, (epochs_since_gate + 1) / max(1, args.horizon_ramp_epochs))
-            current_horizon_weight = args.horizon_loss_weight * ramp_fraction
-            logger.info(
-                f"Horizon loss weight ramp: {current_horizon_weight:.4f} / {args.horizon_loss_weight:.4f} "
-                f"(epoch {epochs_since_gate + 1}/{args.horizon_ramp_epochs} since gate opened)"
-            )
+            ramp_step = epochs_since_gate + 1
+            if ramp_step <= args.horizon_ramp_epochs:
+                ramp_fraction = ramp_step / max(1, args.horizon_ramp_epochs)
+                current_horizon_weight = args.horizon_loss_weight * ramp_fraction
+                logger.info(
+                    f"Horizon loss weight ramp: {current_horizon_weight:.4f} / {args.horizon_loss_weight:.4f} "
+                    f"(ramp epoch {ramp_step}/{args.horizon_ramp_epochs})"
+                )
+            else:
+                current_horizon_weight = args.horizon_loss_weight
 
         train_loss, gen_l, occ_l, time_l, type_l, horizon_l = train_epoch(
             model,
@@ -326,12 +395,14 @@ def main():
             horizon_tokens=args.horizon_tokens,
             occ_pos_weight=occ_pos_weight,
             type_class_weights=type_class_weights,
+            occ_loss_weight=args.occ_loss_weight,
             timing_weight=args.timing_weight,
             horizon_loss_weight=current_horizon_weight,
             max_grad_norm=args.max_grad_norm,
             use_horizon_context=horizon_gate_open,
             use_focal_loss=args.use_focal_loss,
             focal_gamma=args.focal_gamma,
+            stage=current_stage,
         )
 
         if not horizon_gate_open and gen_l < args.horizon_gate_threshold:
@@ -342,26 +413,20 @@ def main():
                 f"{args.horizon_gate_threshold}) — Tasks 2/3 will see horizon context from next epoch on. "
                 f"Horizon loss weight will ramp over the next {args.horizon_ramp_epochs} epoch(s)."
             )
-            # Fix 1: decouple the LR warm-restart schedule from the curriculum
-            # change. Without this, a pending CosineAnnealingWarmRestarts
-            # restart (LR jumping back to max) can land on the exact same
-            # epoch the gate opens -- two independent sources of instability
-            # stacking on top of each other. Rebuilding the scheduler here
-            # starts a fresh cosine cycle from the CURRENT (already-decayed)
-            # LR instead of snapping back to max_lr at this moment.
             if scheduler is not None and args.scheduler_type == "cosine":
-                current_lr = optimizer.param_groups[0]["lr"]
                 steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
                 t0 = steps_per_epoch * args.restart_period_epochs
                 scheduler = CosineAnnealingWarmRestarts(
                     optimizer,
                     T_0=t0,
-                    T_mult=2,
+                    T_mult=args.t_mult,
                     eta_min=1e-6,
                 )
+                for group in optimizer.param_groups:
+                    group["lr"] = args.lr
                 logger.info(
-                    f"Scheduler reinitialized at horizon-gate-open (base_lr={current_lr:.2e}) "
-                    f"to avoid restart/curriculum overlap"
+                    f"Scheduler reset at horizon-gate-open with max_lr={args.lr:.2e} "
+                    f"to restart cosine cycle cleanly"
                 )
 
         (
@@ -375,11 +440,13 @@ def main():
             horizon_tokens=args.horizon_tokens,
             occ_pos_weight=occ_pos_weight,
             type_class_weights=type_class_weights,
+            occ_loss_weight=args.occ_loss_weight,
             timing_weight=args.timing_weight,
             use_horizon_context=horizon_gate_open,
             use_focal_loss=args.use_focal_loss,
             focal_gamma=args.focal_gamma,
             num_classes=num_type_classes,
+            occ_threshold=args.occ_threshold,
         )
 
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -390,6 +457,8 @@ def main():
                 "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                "horizon_gate_open": horizon_gate_open,
+                "gate_open_epoch": gate_open_epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_type_acc": val_type_acc,
@@ -415,6 +484,8 @@ def main():
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                    "horizon_gate_open": horizon_gate_open,
+                    "gate_open_epoch": gate_open_epoch,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
                     "val_macro_f1": val_macro_f1,

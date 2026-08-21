@@ -14,6 +14,34 @@ from training.losses import FocalBCEWithLogitsLoss, FocalCrossEntropyLoss, _comp
 from training.metrics import _macro_prf1_from_confusion
 
 
+def set_model_stage(model: nn.Module, stage: int) -> None:
+    """Set parameter trainable status (requires_grad) according to training stage:
+    - Stage 1: Train Conformer backbone + pred_head. Freeze occurrence, preictal, and type classification heads.
+    - Stage 2: Train Conformer backbone + occurrence_timing_head + preictal_head. Freeze type classification head.
+    - Stage 3: Train full model (all parameters active).
+    """
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    stage2_heads = ("occurrence_timing_head", "preictal_head")
+    stage3_heads = ("preictal_type_layer", "preictal_type_head", "type_head")
+
+    if stage == 1:
+        for name, param in raw_model.named_parameters():
+            if any(h in name for h in stage2_heads + stage3_heads):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+    elif stage == 2:
+        for name, param in raw_model.named_parameters():
+            if any(h in name for h in stage3_heads):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+    else:
+        for name, param in raw_model.named_parameters():
+            param.requires_grad = True
+
+
 def train_epoch(
     model: nn.Module,
     train_loader,
@@ -25,12 +53,14 @@ def train_epoch(
     horizon_tokens: int = 10,
     occ_pos_weight: torch.Tensor = None,
     type_class_weights: torch.Tensor = None,
+    occ_loss_weight: float = 2.0,
     timing_weight: float = 0.001,
     horizon_loss_weight: float = 1.0,
     max_grad_norm: float = 1.0,
     use_horizon_context: bool = True,
     use_focal_loss: bool = False,
     focal_gamma: float = 2.0,
+    stage: int = 3,
 ):
     model.train()
     total_loss = 0.0
@@ -50,7 +80,7 @@ def train_epoch(
     use_amp = scaler is not None and device.type == "cuda"
 
     grad_norm: torch.Tensor = torch.tensor(float("nan"))
-    pbar = tqdm(train_loader, desc="Training")
+    pbar = tqdm(train_loader, desc=f"Training [Stage {stage}]")
     for i, batch in enumerate(pbar, start=1):
         if isinstance(batch, (list, tuple)):
             windows, targets = batch
@@ -91,11 +121,6 @@ def train_epoch(
             occ_loss = bce_criterion(occ_logits, occ_targets)
             timing_loss = F.smooth_l1_loss(onset_preds, onset_targets)
 
-            # NOTE: type_mask is intentionally built from `seizure_type_targets`
-            # (an independent label of *which* seizure subtype), not from
-            # occ_targets/labels -- using occ_targets here would make the
-            # "positive" set and the type labels the same variable, which
-            # trivializes the type task. See dataset.py's seizure_type field.
             if seizure_type_targets is not None:
                 type_mask = seizure_type_targets >= 0
             else:
@@ -110,7 +135,24 @@ def train_epoch(
                 preictal_targets = (labels > 0).float().unsqueeze(-1)
                 preictal_loss = bce_criterion(outputs["preictal_logits"], preictal_targets)
 
-            loss = gen_loss + horizon_loss_weight * horizon_loss + occ_loss + timing_weight * timing_loss + type_loss + preictal_loss
+            if stage == 1:
+                loss = gen_loss + horizon_loss_weight * horizon_loss
+            elif stage == 2:
+                loss = (
+                    gen_loss
+                    + horizon_loss_weight * horizon_loss
+                    + occ_loss_weight * occ_loss
+                    + timing_weight * timing_loss
+                )
+            else:
+                loss = (
+                    gen_loss
+                    + horizon_loss_weight * horizon_loss
+                    + occ_loss_weight * occ_loss
+                    + timing_weight * timing_loss
+                    + type_loss
+                    + preictal_loss
+                )
 
             if grad_accum_steps > 1:
                 loss = loss / grad_accum_steps
@@ -174,11 +216,13 @@ def validate(
     horizon_tokens=10,
     occ_pos_weight: torch.Tensor = None,
     type_class_weights: torch.Tensor = None,
+    occ_loss_weight: float = 2.0,
     timing_weight: float = 0.001,
     use_horizon_context: bool = True,
     use_focal_loss: bool = False,
     focal_gamma: float = 2.0,
     num_classes: Optional[int] = None,
+    occ_threshold: Optional[float] = None,
 ):
     model.eval()
     total_loss = 0.0
@@ -196,6 +240,14 @@ def validate(
     else:
         ce_criterion = nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=0.1)
         bce_criterion = nn.BCEWithLogitsLoss(pos_weight=occ_pos_weight)
+
+    if occ_threshold is None:
+        if occ_pos_weight is not None and occ_pos_weight.item() > 0:
+            threshold = 1.0 / (1.0 + occ_pos_weight.item())
+        else:
+            threshold = 0.5
+    else:
+        threshold = occ_threshold
 
     for batch in tqdm(val_loader, desc="Validating"):
         if isinstance(batch, (list, tuple)):
@@ -217,8 +269,6 @@ def validate(
             onset_targets = torch.zeros_like(occ_targets)
             seizure_type_targets = None
 
-        # type_mask (for the seizure-TYPE head) is deliberately independent of
-        # occ_targets/labels -- see the matching note in train_epoch().
         if seizure_type_targets is not None:
             type_mask = seizure_type_targets >= 0
         else:
@@ -253,12 +303,19 @@ def validate(
                 preictal_targets = (labels > 0).float().unsqueeze(-1)
                 preictal_loss = bce_criterion(outputs["preictal_logits"], preictal_targets)
 
-            loss = gen_loss + horizon_loss + occ_loss + timing_weight * timing_loss + type_loss + preictal_loss
+            loss = (
+                gen_loss
+                + horizon_loss
+                + occ_loss_weight * occ_loss
+                + timing_weight * timing_loss
+                + type_loss
+                + preictal_loss
+            )
 
         total_loss += loss.item()
 
         type_preds = type_logits.argmax(dim=-1)
-        occ_preds = (torch.sigmoid(occ_logits) >= 0.5).float()
+        occ_preds = (torch.sigmoid(occ_logits) >= threshold).float()
 
         if type_mask.any():
             correct_type += (type_preds[type_mask] == seizure_type_targets[type_mask]).sum().item()
@@ -270,10 +327,6 @@ def validate(
         correct_occ += (occ_preds == occ_targets).sum().item()
         total_samples += labels.size(0)
 
-        # Occupancy confusion matrix -- this is the piece that was missing
-        # before: occ_acc alone looks fine even when the head has collapsed
-        # to majority-class prediction under imbalance. Per-class support/
-        # precision/recall in occ_cm exposes that directly.
         occ_true_idx = occ_targets.squeeze(-1).long()
         occ_pred_idx = occ_preds.squeeze(-1).long()
         for t, p in zip(occ_true_idx.view(-1).tolist(), occ_pred_idx.view(-1).tolist()):
