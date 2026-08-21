@@ -21,9 +21,9 @@ ALLOWED_LABEL_CATEGORIES = {
     LABEL_CATEGORY_EXCLUDED,
 }
 
-# Known base seizure types from TUH EEG dataset / preictal preprocessing engine
+# Known base seizure types from TUH EEG dataset (TUSZ) / preictal preprocessing engine
 KNOWN_SEIZURE_TYPES = {
-    "fnsz", "gnsz", "cpsz", "spsz", "tnsz", "tcsz", "absz", "mysz", "seiz", "nesz"
+    "fnsz", "gnsz", "cpsz", "spsz", "tnsz", "tcsz", "absz", "mysz", "cnsz", "atsz", "seiz", "sz", "nesz"
 }
 
 # Background raw labels emitted by preprocessing or raw CSVs
@@ -33,7 +33,7 @@ BACKGROUND_LABELS = {
 
 # Artifact / exclusion tags
 EXCLUSION_TAGS = {
-    "artf", "eyem", "chew", "cero", "eloh", "elec", "gspd", "pled"
+    "artf", "eyem", "eybl", "chew", "cero", "eloh", "elec", "gspd", "pled", "spsw", "gped"
 }
 
 

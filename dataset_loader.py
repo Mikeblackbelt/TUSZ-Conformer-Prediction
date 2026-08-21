@@ -24,9 +24,11 @@ from dataset.label_utils import (
     LABEL_CATEGORY_EXCLUDED,
     LABEL_CATEGORY_ICTAL,
     LABEL_CATEGORY_PREICTAL,
+    SEIZURE_TYPE_CLASSES,
     _build_valid_ictal_mask,
     _is_background_label,
     classify_label,
+    extract_seizure_type,
 )
 from dataset.reporting import _bar, _print_dataset_summary
 from dataset.samplers import (

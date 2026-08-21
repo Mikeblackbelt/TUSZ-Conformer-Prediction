@@ -21,7 +21,9 @@ from dataset.label_utils import (
     LABEL_CATEGORY_EXCLUDED,
     LABEL_CATEGORY_ICTAL,
     LABEL_CATEGORY_PREICTAL,
+    SEIZURE_TYPE_CLASSES,
     classify_label,
+    extract_seizure_type,
 )
 from dataset.reporting import _bar, _print_dataset_summary
 from dataset.samplers import (
@@ -38,6 +40,8 @@ __all__ = [
     "build_dataloaders",
     "split_by_column",
     "classify_label",
+    "extract_seizure_type",
+    "SEIZURE_TYPE_CLASSES",
     "LABEL_CATEGORY_BACKGROUND",
     "LABEL_CATEGORY_PREICTAL",
     "LABEL_CATEGORY_ICTAL",
