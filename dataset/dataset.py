@@ -27,6 +27,7 @@ from dataset.label_utils import (
     LABEL_CATEGORY_BACKGROUND,
     LABEL_CATEGORY_PREICTAL,
     LABEL_CATEGORY_ICTAL,
+    LABEL_CATEGORY_EXCLUDED,
     SEIZURE_TYPE_CLASSES,
     _build_valid_ictal_mask,
     _is_background_label,
@@ -58,7 +59,7 @@ class EEGWindowDataset(Dataset):
         status_col: str = "status",
         term_value: Optional[str] = None,
         exclude_status: Optional[set] = {0, 2},
-        exclude_prefix: Tuple[str, ...] = ("x", "q", "c"),
+        exclude_prefix: bool = True,
         exclude_labels: Tuple[str, ...] = ("bckg",),
         exclude_ictal_without_preictal: bool = True,
         min_confidence: Optional[float] = None,
@@ -110,10 +111,13 @@ class EEGWindowDataset(Dataset):
             self.df = self.df[keep_mask].reset_index(drop=True)
         counts["after_ictal_filter"] = len(self.df)
 
-        # 4. Label Exclusion Prefix Filtering
+        # 4. Excluded-category filtering (postictal q*, consecutive c*,
+        # artifact/exclusion x*, SOP-buffer p*_sopbuffer, ...).
+   
         if exclude_prefix and label_col in self.df.columns:
-            pattern = "^(?:" + "|".join(exclude_prefix) + ")"
-            self.df = self.df[~self.df[label_col].astype(str).str.contains(pattern, regex=True)].reset_index(drop=True)
+            self.df = self.df[
+                self.df[label_col].apply(lambda l: classify_label(l) != LABEL_CATEGORY_EXCLUDED)
+            ].reset_index(drop=True)
         counts["after_label_prefix"] = len(self.df)
 
         # 5. Confidence Filtering
