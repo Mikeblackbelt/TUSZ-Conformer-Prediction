@@ -337,6 +337,10 @@ def validate(
     occ_acc = correct_occ / total_samples if total_samples > 0 else 0.0
     macro_precision, macro_recall, macro_f1 = _macro_prf1_from_confusion(cm)
     occ_precision, occ_recall, occ_f1 = _macro_prf1_from_confusion(occ_cm)
+    # `cm` (seizure-TYPE confusion matrix, num_type_classes x num_type_classes)
+    # is returned alongside the scalar metrics so callers can log/inspect
+    # per-class performance every epoch without paying for a second full
+    # pass over val_loader (see training.metrics.log_confusion_matrix).
     return (
         total_loss / num_batches,
         type_acc,
@@ -348,4 +352,5 @@ def validate(
         occ_precision,
         occ_recall,
         occ_f1,
+        cm,
     )

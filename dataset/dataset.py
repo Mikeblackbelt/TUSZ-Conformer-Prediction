@@ -113,7 +113,24 @@ class EEGWindowDataset(Dataset):
 
         # 4. Excluded-category filtering (postictal q*, consecutive c*,
         # artifact/exclusion x*, SOP-buffer p*_sopbuffer, ...).
-   
+        #
+        # FIX: this used to be a raw regex prefix match on the literal label
+        # string: pattern = "^(?:x|q|c)" -> drop any label starting with
+        # x/q/c. That's wrong because two of the real TUSZ seizure TYPE
+        # abbreviations -- "cpsz" (complex partial) and "cnsz" (clonic) --
+        # also start with the letter "c" used here to mark *consecutive*
+        # rows (e.g. "cgnszfnsz"). The old regex could not tell the two
+        # apart, so every bare "cpsz"/"cnsz" ictal window was silently
+        # dropped from every training run: those two seizure-type classes
+        # never had a single training example, which is exactly the class
+        # collapse symptom (0 recall, 0 precision, permanently) reported for
+        # the Task-3 seizure-type classifier.
+        #
+        # classify_label() already resolves this correctly (it checks for
+        # an exact match against KNOWN_SEIZURE_TYPES *before* falling back
+        # to prefix-based parsing -- see dataset/label_utils.py and
+        # tests/test_tusz_labels.py), so route this filter through it
+        # instead of re-implementing a naive, ambiguous prefix check here.
         if exclude_prefix and label_col in self.df.columns:
             self.df = self.df[
                 self.df[label_col].apply(lambda l: classify_label(l) != LABEL_CATEGORY_EXCLUDED)
@@ -125,9 +142,53 @@ class EEGWindowDataset(Dataset):
             self.df = self.df[self.df[confidence_col] >= min_confidence].reset_index(drop=True)
         counts["after_confidence"] = len(self.df)
 
+        # FIX: this "no rows left" check used to live only at the very end
+        # of __init__ (after step 6 / checkpoint verification). If self.df
+        # was already empty by this point (steps 1-5 above), execution
+        # would still fall through into step 5b's background-subsampling
+        # block, where `int((~bg_mask).sum())` blows up with a cryptic,
+        # unrelated-looking error:
+        #   ValueError: invalid literal for int() with base 10: ''
+        # (pandas >=3.0 infers .apply() output dtype as the new default
+        # "str" dtype when applied to a zero-row Series, and .sum() on an
+        # empty "str"-dtype Series returns the string-concatenation
+        # identity '' instead of 0 -- see pandas PDEP-14). That completely
+        # masked the actually useful diagnostic below. Check for an empty
+        # dataframe here, immediately after the last filtering step that
+        # can legitimately drop everything, so the real cause (which
+        # filter stage zeroed out the data) is reported immediately instead
+        # of being hidden behind an unrelated pandas dtype crash two steps
+        # later.
+        if len(self.df) == 0:
+            raise ValueError(
+                "No rows left after filtering (before background "
+                "subsampling / checkpoint verification)! Filter breakdown:\n"
+                f"  - Initial CSV rows: {counts.get('initial')}\n"
+                f"  - After channel filter (term_value={term_value}): {counts.get('after_channel')}\n"
+                f"  - After status filter (exclude_status={exclude_status}): {counts.get('after_status')}\n"
+                f"  - After exact-label exclusion (exclude_labels={exclude_labels}): {counts.get('after_exclude_labels')}\n"
+                f"  - After ictal-validity filter (exclude_ictal_without_preictal={exclude_ictal_without_preictal}): {counts.get('after_ictal_filter')}\n"
+                f"  - After excluded-category filter (exclude_prefix={exclude_prefix}): {counts.get('after_label_prefix')}\n"
+                f"  - After confidence filter (min_confidence={min_confidence}): {counts.get('after_confidence')}\n"
+                f"Check your filter options, master_csv contents, or WSL path formats."
+            )
+
         # 5b. Background subsampling
         if max_bg_ratio is not None:
-            bg_mask = self.df[label_col].apply(lambda l: classify_label(l) == LABEL_CATEGORY_BACKGROUND)
+            # FIX: explicitly cast to bool right after computing the mask.
+            # classify_label(l) == LABEL_CATEGORY_BACKGROUND always returns a
+            # plain Python bool per-element, but pandas' dtype inference for
+            # the *Series* .apply() produces can vary (object vs. the pandas
+            # >=3.0 default "str" dtype) depending on pandas version and
+            # whether self.df has any rows at all. An explicit .astype(bool)
+            # here guarantees `~bg_mask` and `.sum()` always behave like a
+            # real boolean mask regardless of pandas version, instead of
+            # silently depending on dtype inference that changed in pandas
+            # 3.0 (see the empty-dataframe check above for what goes wrong
+            # otherwise).
+            bg_mask = self.df[label_col].apply(
+                lambda l: classify_label(l) == LABEL_CATEGORY_BACKGROUND
+            ).astype(bool)
             n_nonbg = int((~bg_mask).sum())
             n_bg = int(bg_mask.sum())
             max_bg = int(n_nonbg * max_bg_ratio)

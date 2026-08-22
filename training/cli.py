@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR
 from dataset.samplers import build_dataloaders, split_by_column
 from models.conformer import CausalEEGConformer
 from models.simplified_conformer import SimplifiedEEGConformer
-from training.metrics import compute_confusion_matrix, log_confusion_matrix
+from training.metrics import log_confusion_matrix
 from training.trainer import set_model_stage, train_epoch, validate
 
 
@@ -170,6 +170,22 @@ def main():
         default=8.0,
         help="Max per-class weight for the seizure-type loss (default: 8.0). "
              "Lower this further if most classes saturate at the cap.",
+    )
+    parser.add_argument(
+        "--confusion-log-every",
+        type=int,
+        default=1,
+        help=(
+            "Log the full per-class seizure-TYPE confusion matrix (support, "
+            "precision, recall, F1 per class) every N epochs (default: 1, "
+            "i.e. every epoch). Previously this only printed once, after "
+            "the entire run finished, which made it impossible to notice a "
+            "collapsed class (e.g. 0 recall) until the whole training job "
+            "was already done. Set higher (e.g. 5) to reduce log volume on "
+            "long runs; the confusion matrix itself is already computed as "
+            "part of validate() every epoch regardless of this setting, so "
+            "this only controls how often it's printed, not extra compute."
+        ),
     )
     parser.add_argument(
         "--exclude-labels",
@@ -354,6 +370,7 @@ def main():
 
     logger.info("Starting Multi-Task Training Loop...")
     previous_stage: Optional[int] = None
+    val_type_cm: Optional[torch.Tensor] = None
     for epoch in range(start_epoch, args.epochs + 1):
         current_stage = get_training_stage(epoch, args)
         set_model_stage(model, current_stage)
@@ -431,7 +448,7 @@ def main():
 
         (
             val_loss, val_type_acc, val_occ_acc, val_macro_f1, val_macro_precision, val_macro_recall,
-            val_occ_cm, val_occ_precision, val_occ_recall, val_occ_f1,
+            val_occ_cm, val_occ_precision, val_occ_recall, val_occ_f1, val_type_cm,
         ) = validate(
             model,
             val_loader,
@@ -515,17 +532,38 @@ def main():
             f"Occ Macro-F1: {val_occ_f1:.4f} (P: {val_occ_precision:.4f} / R: {val_occ_recall:.4f})"
         )
 
-    logger.info("Training complete. Computing final confusion matrix on validation set...")
-    # Labeled by seizure TYPE (fnsz/gnsz/...), not by the binary
-    # occurrence/preictal flag -- dataset.num_classes/label_map describe the
-    # latter and would mislabel this matrix.
-    cm = compute_confusion_matrix(
-        model,
-        val_loader,
-        device,
-        num_type_classes,
-        use_amp=use_amp,
-        horizon_tokens=args.horizon_tokens,
-        use_horizon_context=horizon_gate_open,
-    )
-    log_confusion_matrix(cm, label_names=dataset.type_classes)
+        # Per-class seizure-TYPE confusion matrix, logged every
+        # --confusion-log-every epochs (default: every epoch). This is the
+        # earliest, cheapest signal for class collapse (a class stuck at
+        # support>0/recall==0 for several consecutive epochs) -- val_type_cm
+        # is already computed inside validate() above, so this adds no
+        # extra passes over val_loader, just visibility.
+        if args.confusion_log_every > 0 and (
+            epoch % args.confusion_log_every == 0 or epoch == args.epochs
+        ):
+            log_confusion_matrix(val_type_cm, label_names=dataset.type_classes)
+            collapsed = [
+                dataset.type_classes[i]
+                for i in range(val_type_cm.shape[0])
+                if val_type_cm[i, :].sum().item() > 0 and val_type_cm[i, i].item() == 0
+            ]
+            if collapsed:
+                logger.warning(
+                    f"           Possible class collapse: {collapsed} have validation "
+                    f"support > 0 but 0 correct predictions this epoch."
+                )
+
+    logger.info("Training complete.")
+    # The final epoch's seizure-TYPE confusion matrix was already computed
+    # inside validate() and logged above (the `epoch == args.epochs` branch
+    # of the --confusion-log-every check always fires on the last epoch
+    # regardless of N), so we reuse it here instead of paying for another
+    # full pass over val_loader with an identical model state.
+    if val_type_cm is not None:
+        logger.info("Final validation confusion matrix (seizure TYPE):")
+        log_confusion_matrix(val_type_cm, label_names=dataset.type_classes)
+    else:
+        logger.info(
+            "No epochs were run this invocation (checkpoint already at/beyond "
+            "--epochs) -- nothing new to log."
+        )
